@@ -1,0 +1,2813 @@
+import asyncio
+import logging
+import sys
+import re
+import os
+import shutil
+import tempfile
+import random
+import html
+from datetime import datetime, timezone
+import aiohttp
+from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, LabeledPrice, PreCheckoutQuery, Message
+
+from config import BOT_TOKEN, OWNER_ID, REQUIRED_CHANNELS, ADMIN_LOG_GROUP_ID
+import database as db
+from userbot import start_userbot_for_account, active_clients, extract_account_info, get_devices, terminate_device, process_uploaded_session, terminate_bot_session, join_channel_with_session, logout_session, touch, cleanup_idle_clients
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+CO_OWNER_ID = 0
+
+STAR_RATE = 1.3
+DETAILED_LOG_GROUP_ID = ADMIN_LOG_GROUP_ID  # from env; None = detailed logs skipped
+
+DEPOSIT_MIN_AMOUNT = 30
+UPI_ID = "yourupi@okbank"          # TODO: replace with your real UPI ID
+UPI_QR_IMAGE_PATH = "upi_qr.jpg"   # TODO: put your QR code image file at this path (same folder as bot.py)
+GP_MIN_AMOUNT = 30
+GP_MAX_AMOUNT = 10000
+GP_RATE = 1.0        # wallet balance given per Rs.1 of redeem code
+MIN_STARS = 15
+MAX_STARS = 10000   # Telegram invoice limit
+
+# Quick-pick amounts shown as buttons on the Stars top-up screen (in addition
+# to the custom-amount text option).
+STARS_QUICK_AMOUNTS = [50, 100, 250, 500, 1000]
+
+LOW_STOCK_THRESHOLD = 3   # categories at/under this many accounts get a "🔥 low stock" badge
+
+
+def stars_bonus_percent(stars_count: int) -> int:
+    """Bigger Stars top-ups get a small bonus credited on top, as an
+    incentive for larger packs. Tune the thresholds/percentages here."""
+    if stars_count >= 1000:
+        return 10
+    if stars_count >= 500:
+        return 5
+    return 0
+
+
+PRIVACY_POLICY_TEXT = """📜 Privacy Policy & Terms – ZEROX OTP BOT
+
+Last updated: October 2026
+
+1. Data We Collect
+When you use this bot, we store:
+- Your Telegram user ID
+- Your wallet balance
+- Your payment and purchase history
+- Referral information
+
+We do not collect your phone number, real name, or any card or payment details. Payments made with Telegram Stars are processed entirely by Telegram.
+
+2. How We Use Your Data
+- To manage your wallet and process top-ups
+- To deliver the accounts you purchase
+- To prevent fraud, abuse, and duplicate payments
+- To provide customer support
+
+3. Data Sharing
+We do not sell or share your data with third parties. Data may be disclosed only if required by law.
+
+4. Data Security
+Your data is stored in a secured database with restricted access. No system is 100% secure, but we take reasonable steps to protect it.
+
+5. No Refund & No Liability Policy
+- All purchases are final. Once an account is delivered, no refund will be given.
+- We are only responsible for delivering the account details and the login OTP.
+- After the account is logged in and the OTP is delivered, we are not responsible for anything that happens to the account, including but not limited to freeze, ban, restriction, logout, session termination, or loss of access.
+- Account safety after delivery depends on how you use it. Any issue after delivery is entirely at your own risk.
+- Wallet balance and Stars top-ups cannot be withdrawn or refunded.
+
+6. Acceptance of Terms
+By using this bot and making a purchase, you confirm that you have read and agreed to these terms.
+
+7. Your Choices
+You can stop using the bot at any time. To request deletion of your data, contact us.
+
+8. Contact
+Telegram: @Meto_bacchi_hu"""
+
+_SMALL_CAPS_MAP = {
+    'a': 'ᴀ', 'b': 'ʙ', 'c': 'ᴄ', 'd': 'ᴅ', 'e': 'ᴇ', 'f': 'ꜰ', 'g': 'ɢ', 'h': 'ʜ', 'i': 'ɪ',
+    'j': 'ᴊ', 'k': 'ᴋ', 'l': 'ʟ', 'm': 'ᴍ', 'n': 'ɴ', 'o': 'ᴏ', 'p': 'ᴘ', 'q': 'q', 'r': 'ʀ',
+    's': 'ꜱ', 't': 'ᴛ', 'u': 'ᴜ', 'v': 'ᴠ', 'w': 'ᴡ', 'x': 'x', 'y': 'ʏ', 'z': 'ᴢ',
+}
+
+def sc(text: str) -> str:
+    """Converts text to small-caps style (used for button labels and headings)."""
+    return "".join(_SMALL_CAPS_MAP.get(ch.lower(), ch) for ch in text)
+
+def is_admin(user_id: int) -> bool:
+    return user_id == OWNER_ID or user_id == CO_OWNER_ID
+
+
+# ---------------- Ban middleware (applies to all handlers) ----------------
+class BanMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user and not is_admin(user.id):
+            u = await db.get_user(user.id)
+            if u and u.get("is_banned", 0) == 1:
+                if isinstance(event, types.CallbackQuery):
+                    await event.answer("❌ You are banned from using this bot.", show_alert=True)
+                elif isinstance(event, types.Message):
+                    await event.answer("❌ You are banned from using this bot.")
+                return
+        return await handler(event, data)
+
+
+dp.message.middleware(BanMiddleware())
+dp.callback_query.middleware(BanMiddleware())
+
+
+class AddItemState(StatesGroup):
+    waiting_for_display_name = State()
+    waiting_for_price = State()
+    waiting_for_session = State()
+    waiting_for_two_step = State()
+
+class AddCategoryState(StatesGroup):
+    waiting_for_name = State()
+
+class AddTierState(StatesGroup):
+    waiting_for_name = State()
+
+class EditCategoryState(StatesGroup):
+    waiting_for_new_name = State()
+
+class BroadcastState(StatesGroup):
+    waiting_for_message = State()
+
+class BanUserState(StatesGroup):
+    waiting_for_user_id = State()
+
+class SupplierConfigState(StatesGroup):
+    waiting_for_url = State()
+    waiting_for_key = State()
+
+class GPTopupState(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_code = State()
+    waiting_for_screenshot = State()
+
+class DepositState(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_screenshot = State()
+
+class StarsTopupState(StatesGroup):
+    waiting_for_amount = State()
+
+class ReportIssueState(StatesGroup):
+    waiting_for_description = State()
+
+
+def mask_phone_number(phone: str) -> str:
+    if len(phone) > 8:
+        return phone[:3] + "******" + phone[-2:]
+    return phone
+
+async def set_bot_commands(bot_instance: Bot):
+    user_commands = [
+        BotCommand(command="start", description="Start the bot 🚀"),
+        BotCommand(command="wallet", description="Open your wallet 💰"),
+        BotCommand(command="myorders", description="View your purchase history 📦"),
+        BotCommand(command="referral", description="Invite & earn bonus 👥"),
+        BotCommand(command="deposit", description="Deposit funds (UPI/Crypto) 💳"),
+        BotCommand(command="privacy", description="Privacy Policy & Terms 📜"),
+    ]
+    await bot_instance.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+
+    owner_commands = [
+        BotCommand(command="start", description="Start the bot 🚀"),
+        BotCommand(command="wallet", description="Open your wallet 💰"),
+        BotCommand(command="myorders", description="View your purchase history 📦"),
+        BotCommand(command="referral", description="Invite & earn bonus 👥"),
+        BotCommand(command="deposit", description="Deposit funds (UPI/Crypto) 💳"),
+        BotCommand(command="privacy", description="Privacy Policy & Terms 📜"),
+        BotCommand(command="admin", description="Open Admin Panel ⚙"),
+        BotCommand(command="add", description="Add new account ➕"),
+        BotCommand(command="groupid", description="Get this chat's ID 🆔"),
+        BotCommand(command="checkchannels", description="Diagnose required-channel membership checks 🔍"),
+        BotCommand(command="join", description="Join all accounts to a channel 📢"),
+        BotCommand(command="logoutall", description="Log bot out of all accounts 🚪"),
+        BotCommand(command="dd", description="Add balance to a user 💰"),
+        BotCommand(command="ss", description="Deduct balance from a user 💸"),
+    ]
+    try:
+        await bot_instance.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
+        if CO_OWNER_ID:
+            await bot_instance.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=CO_OWNER_ID))
+    except Exception as e:
+        print(f"Command setup error: {e}")
+
+async def check_user_channels(user_id: int) -> bool:
+    if not REQUIRED_CHANNELS:
+        return True
+
+    async def _is_member(channel):
+        try:
+            member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+            return member.status in ["member", "administrator", "creator"]
+        except Exception:
+            return False
+
+    # Run all channel-membership checks concurrently instead of one-by-one —
+    # this was the main cause of /start feeling slow (each sequential Telegram
+    # API call adds ~200-400ms; with several channels that stacks up to 1-2+ sec).
+    to_check = [ch["chat"] for ch in REQUIRED_CHANNELS if ch.get("chat") is not None]
+    results = await asyncio.gather(*(_is_member(ch) for ch in to_check))
+    return all(results)
+
+BOT_DISPLAY_NAME = "ZEROX OTP BOT"
+
+async def send_main_menu(message_or_callback, note: str = "", user_data: dict = None):
+    user_id = message_or_callback.from_user.id
+    first_name = message_or_callback.from_user.first_name or "there"
+
+    if user_data is None:
+        user_data = await db.get_user(user_id)
+    if user_data and user_data.get('is_banned', 0) == 1:
+        if isinstance(message_or_callback, types.CallbackQuery):
+            await message_or_callback.answer("❌ You are banned from using this bot.", show_alert=True)
+        else:
+            await message_or_callback.answer("❌ You are banned from using this bot.")
+        return
+
+    balance = user_data.get("balance", 0.0) if user_data else 0.0
+    note_block = f"{note}\n\n" if note else ""
+
+    text = (
+        f"👋 Hi {first_name},\n"
+        f"{note_block}"
+        f"💎 **{sc(BOT_DISPLAY_NAME)}** 🤖\n"
+        f"Premium Digital Services & Assets.\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🆔 {user_id}\n"
+        f"💰 Your Wallet: ₹{balance:.2f}\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"⚡ Instant Delivery\n"
+        f"🔒 Secure Payments\n\n"
+        f"👇 Select an option:"
+    )
+
+    kb = [
+        [InlineKeyboardButton(text=sc("🛒 Buy Now"), callback_data="shop")],
+        [
+            InlineKeyboardButton(text=sc("💳 Wallet"), callback_data="wallet"),
+            InlineKeyboardButton(text=sc("➕ Deposit"), callback_data="add_funds_menu_home")
+        ],
+        [
+            InlineKeyboardButton(text=sc("📦 My Orders"), callback_data="my_orders"),
+            InlineKeyboardButton(text=sc("👥 Referral"), callback_data="referral_menu")
+        ],
+        [
+            InlineKeyboardButton(text=sc("👤 Profile"), callback_data="my_profile"),
+            InlineKeyboardButton(text=sc("🆘 Support"), callback_data="support")
+        ],
+        [
+            InlineKeyboardButton(text=sc("📜 Privacy Policy"), callback_data="privacy_policy")
+        ]
+    ]
+    if is_admin(user_id):
+        kb.append([InlineKeyboardButton(text=sc("⚙️ Admin Panel"), callback_data="admin_panel")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+    if isinstance(message_or_callback, types.CallbackQuery):
+        await message_or_callback.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await message_or_callback.answer(text, reply_markup=markup, parse_mode="Markdown")
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+
+    user_data = await db.get_user(user_id)
+
+    args = message.text.split()
+    if len(args) > 1 and args[1].startswith("ref_"):
+        try:
+            referrer_id = int(args[1].split("_")[1])
+            if referrer_id != user_id and user_data.get("referred_by") is None:
+                await db.users_col.update_one(
+                    {"user_id": user_id},
+                    {"$set": {"referred_by": referrer_id, "referral_rewarded": 0}}
+                )
+                user_data["referred_by"] = referrer_id
+        except Exception:
+            pass
+
+    if user_data and user_data.get('is_banned', 0) == 1:
+        await message.answer("❌ You are banned from using this bot.")
+        return
+
+    if user_data["is_verified"] == 1:
+        still_member = await check_user_channels(user_id)
+        if still_member:
+            await send_main_menu(message, "✅ Welcome back!", user_data=user_data)
+            return
+        else:
+            await db.update_verification(user_id, 0)
+
+    kb = []
+    for idx, ch in enumerate(REQUIRED_CHANNELS, start=1):
+        kb.append([InlineKeyboardButton(text=sc(f"📢 Join Channel {idx}"), url=ch["link"])])
+    kb.append([InlineKeyboardButton(text=sc("✅ Verify Membership"), callback_data="verify_membership")])
+
+    await message.answer(
+        "👋 **ᴡᴇʟᴄᴏᴍᴇ!**\n\nTo use this bot, you must join our required channels first. Please join them and click **'Verify Membership'**:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "verify_membership")
+async def verify_membership_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    joined = await check_user_channels(user_id)
+
+    if joined:
+        await db.update_verification(user_id, 1)
+
+        user_data = await db.get_user(user_id)
+        if user_data.get("referred_by") and user_data.get("referral_rewarded", 0) == 0:
+            referrer_id = user_data["referred_by"]
+            # atomic: reward is given only once
+            res = await db.users_col.update_one(
+                {"user_id": user_id, "referral_rewarded": 0},
+                {"$set": {"referral_rewarded": 1}}
+            )
+            if res.modified_count == 1:
+                await db.users_col.update_one(
+                    {"user_id": referrer_id},
+                    {"$inc": {"referral_count": 1, "balance": 0.001}}
+                )
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 **ʀᴇꜰᴇʀʀᴀʟ ʙᴏɴᴜꜱ!** User `{user_id}` verified their membership using your link. **₹0.001** added to your balance!",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+        await callback.answer("Verified successfully! ✅", show_alert=True)
+
+        if user_data.get("onboarded", 0) == 0:
+            await show_onboarding_intro(callback)
+            await db.mark_onboarded(user_id)
+        else:
+            await send_main_menu(callback, "🎉 Verification Successful!")
+    else:
+        await callback.answer("❌ You haven't joined all required channels yet! Please join them first.", show_alert=True)
+
+
+async def show_onboarding_intro(callback: types.CallbackQuery):
+    """Shown exactly once, right after a user's very first successful
+    verification — a quick orientation before they land on the main menu."""
+    text = (
+        f"🎉 **ʏᴏᴜ'ʀᴇ ɪɴ!**\n\n"
+        f"Here's a 30-second tour of {sc(BOT_DISPLAY_NAME)}:\n\n"
+        f"🛒 **Buy Now** — browse accounts by type and country, instant delivery\n"
+        f"💰 **Wallet** — add funds via Stars, Google Play codes, or UPI/Crypto\n"
+        f"📦 **My Orders** — every account you've bought, anytime\n"
+        f"📥 **Get Code / Devices** — manage any account you purchase, right from the bot\n\n"
+        f"That's it — you're ready to go 👇"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🚀 Let's Go"), callback_data="back_home")]])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+
+def payment_line(p: dict) -> str:
+    """One readable line for a payment record — used in both the Wallet
+    preview and the full My Transactions list."""
+    currency = p.get("currency", "")
+    status = p.get("status", "")
+    ts = p.get("timestamp")
+    date_str = ts.strftime("%d %b, %I:%M %p") if ts else ""
+
+    if status == "SPEND_BUY_ACCOUNT":
+        icon, label = "🛒", "Purchase"
+        amount_str = f"-₹{p['amount']:.2f}"
+    elif currency == "STARS":
+        icon, label = "⭐", f"Stars Top-up ({p.get('stars', '?')}⭐)"
+        amount_str = f"+₹{p['amount']:.2f}"
+    elif currency == "GPLAY":
+        icon, label = "🎁", "Google Play"
+        amount_str = f"+₹{p['amount']:.2f}"
+    elif currency == "DEPOSIT":
+        icon, label = "🏦", "Deposit"
+        amount_str = f"+₹{p['amount']:.2f}"
+    else:
+        icon, label = "💠", currency or "Payment"
+        amount_str = f"₹{p['amount']:.2f}"
+
+    return f"{icon} {label} — **{amount_str}**" + (f" · {date_str}" if date_str else "")
+
+
+@dp.message(Command("wallet"))
+@dp.callback_query(F.data == "wallet")
+async def show_wallet(event: types.Message | types.CallbackQuery):
+    user_id = event.from_user.id
+    user = await db.get_user(user_id)
+    payments = await db.get_user_payments(user_id)
+
+    history_text = "📜 **ʀᴇᴄᴇɴᴛ ᴀᴄᴛɪᴠɪᴛʏ:**\n"
+    if not payments:
+        history_text += "No payment history yet."
+    else:
+        for p in payments[:5]:
+            history_text += f"{payment_line(p)}\n"
+
+    kb = [
+        [InlineKeyboardButton(text=sc("➕ Add Funds"), callback_data="add_funds_menu_wallet")],
+        [InlineKeyboardButton(text=sc("📜 My Transactions"), callback_data="my_transactions_0")],
+        [InlineKeyboardButton(text=sc("🔙 Back"), callback_data="back_home")]
+    ]
+
+    text = (
+        f"💰 **ʏᴏᴜʀ ᴡᴀʟʟᴇᴛ**\n\n"
+        f"💵 Balance: **₹{user['balance']:.3f}**\n\n"
+        f"{history_text}"
+    )
+
+    if isinstance(event, types.CallbackQuery):
+        await event.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    else:
+        await event.answer(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+
+TRANSACTIONS_PAGE_SIZE = 10
+
+@dp.callback_query(F.data.startswith("my_transactions_"))
+async def my_transactions_handler(callback: types.CallbackQuery):
+    page = int(callback.data.rsplit("_", 1)[1])
+    payments = await db.get_user_payments(callback.from_user.id)  # newest first, up to 50
+
+    if not payments:
+        await callback.message.edit_text(
+            sc("📜 my transactions\n\nNo transactions yet."),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="wallet")]]),
+            parse_mode="Markdown"
+        )
+        return
+
+    total_pages = (len(payments) + TRANSACTIONS_PAGE_SIZE - 1) // TRANSACTIONS_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start = page * TRANSACTIONS_PAGE_SIZE
+    page_items = payments[start:start + TRANSACTIONS_PAGE_SIZE]
+
+    lines = [f"📜 **My Transactions** (Page {page + 1}/{total_pages})\n"]
+    for p in page_items:
+        lines.append(payment_line(p))
+    text = "\n".join(lines)
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text=sc("⬅️ Prev"), callback_data=f"my_transactions_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text=sc("Next ➡️"), callback_data=f"my_transactions_{page + 1}"))
+
+    kb_rows = []
+    if nav_row:
+        kb_rows.append(nav_row)
+    kb_rows.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="wallet")])
+
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+async def render_add_funds_menu(callback: types.CallbackQuery, state: FSMContext, origin: str = None):
+    """origin is 'wallet' (reached via Wallet) or 'home' (reached via the Main Menu
+    shortcut). If not given, it's read back from state (so Cancel from deeper in
+    the flow still returns to the correct place)."""
+    if origin is None:
+        data = await state.get_data()
+        origin = data.get("funds_origin", "wallet")
+
+    await state.clear()
+    await state.update_data(funds_origin=origin)
+
+    back_target = "wallet" if origin == "wallet" else "back_home"
+    kb = [
+        [InlineKeyboardButton(text=sc("⭐ Telegram Stars"), callback_data="add_funds_stars")],
+        [InlineKeyboardButton(text=sc("🎁 Google Play Code"), callback_data="add_funds_gp")],
+        [InlineKeyboardButton(text=sc("💳 Deposit (UPI / Crypto)"), callback_data="add_funds_deposit")],
+        [InlineKeyboardButton(text=sc("🔙 Back"), callback_data=back_target)]
+    ]
+    await callback.message.edit_text(
+        "➕ **ᴀᴅᴅ ꜰᴜɴᴅꜱ**\n\nSelect how you'd like to add funds:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "add_funds_menu_wallet")
+async def add_funds_menu_from_wallet(callback: types.CallbackQuery, state: FSMContext):
+    await render_add_funds_menu(callback, state, origin="wallet")
+    await callback.answer()
+
+@dp.callback_query(F.data == "add_funds_menu_home")
+async def add_funds_menu_from_home(callback: types.CallbackQuery, state: FSMContext):
+    await render_add_funds_menu(callback, state, origin="home")
+    await callback.answer()
+
+def stars_breakdown_text(stars_count: int) -> str:
+    """One clear line showing exactly what a given Stars amount turns into,
+    base value + bonus if any — used both on the picker screen and right
+    before an invoice is sent."""
+    base_inr = stars_count * STAR_RATE
+    bonus_pct = stars_bonus_percent(stars_count)
+    if bonus_pct:
+        bonus_inr = base_inr * bonus_pct / 100
+        total_inr = base_inr + bonus_inr
+        return (
+            f"{stars_count} ⭐ = ₹{base_inr:.2f}"
+            f" + 🎁 {bonus_pct}% bonus (₹{bonus_inr:.2f})"
+            f" = **₹{total_inr:.2f}** credited"
+        )
+    return f"{stars_count} ⭐ = **₹{base_inr:.2f}** credited"
+
+
+@dp.callback_query(F.data == "add_funds_stars")
+async def add_funds_stars_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    quick_rows = []
+    row = []
+    for amt in STARS_QUICK_AMOUNTS:
+        bonus_pct = stars_bonus_percent(amt)
+        label = f"{amt} ⭐" + (f" +{bonus_pct}%" if bonus_pct else "")
+        row.append(InlineKeyboardButton(text=sc(label), callback_data=f"stars_quick_{amt}"))
+        if len(row) == 2:
+            quick_rows.append(row)
+            row = []
+    if row:
+        quick_rows.append(row)
+
+    kb = quick_rows + [
+        [InlineKeyboardButton(text=sc("✍️ Custom Amount"), callback_data="stars_custom")],
+        [InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="cancel_topup")]
+    ]
+
+    bonus_lines = "\n".join(
+        f"• {amt}+ Stars → 🎁 {stars_bonus_percent(amt)}% bonus"
+        for amt in sorted({a for a in STARS_QUICK_AMOUNTS if stars_bonus_percent(a) > 0})
+    )
+    text = (
+        "⭐ **ᴀᴅᴅ ꜰᴜɴᴅꜱ ᴠɪᴀ ᴛᴇʟᴇɢʀᴀᴍ ꜱᴛᴀʀꜱ**\n\n"
+        f"• Minimum top-up: **{MIN_STARS} Stars**\n"
+        f"• Rate: `1 Star = ₹{STAR_RATE}`\n"
+        + (f"\n**Bonus packs:**\n{bonus_lines}\n" if bonus_lines else "")
+        + "\n👇 Pick an amount, or enter your own:"
+    )
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "stars_custom")
+async def add_funds_stars_custom(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(StarsTopupState.waiting_for_amount)
+    await callback.message.edit_text(
+        f"✍️ How many Stars do you want to add? Send a number (e.g., `50`, min **{MIN_STARS}**):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="cancel_topup")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+async def send_stars_invoice(chat_id: int, stars_count: int):
+    prices = [LabeledPrice(label=f"{stars_count} Telegram Stars", amount=stars_count)]
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title="Add Wallet Balance",
+        description=stars_breakdown_text(stars_count).replace("**", ""),
+        payload=f"topup_{stars_count}",
+        currency="XTR",
+        prices=prices,
+        provider_token=""
+    )
+
+
+@dp.callback_query(F.data.startswith("stars_quick_"))
+async def stars_quick_pick(callback: types.CallbackQuery, state: FSMContext):
+    stars_count = int(callback.data.rsplit("_", 1)[1])
+    await state.clear()
+    await send_stars_invoice(callback.message.chat.id, stars_count)
+    await callback.answer()
+
+
+@dp.message(StarsTopupState.waiting_for_amount)
+async def send_stars_invoice_action(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("❌ Please send a whole number only (e.g., 50).")
+        return
+
+    stars_count = int(text)
+    if stars_count < MIN_STARS:
+        await message.answer(f"❌ Minimum top-up is {MIN_STARS} Stars. Please send a higher number:")
+        return
+    if stars_count > MAX_STARS:
+        await message.answer(f"❌ Maximum is {MAX_STARS} Stars per top-up. Please send a lower number:")
+        return
+
+    await state.clear()
+    await message.answer(f"✅ {stars_breakdown_text(stars_count)}\n\nSending the invoice...", parse_mode="Markdown")
+    await send_stars_invoice(message.from_user.id, stars_count)
+
+@dp.pre_checkout_query()
+async def process_stars_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def process_stars_successful_payment(message: Message):
+    pay = message.successful_payment
+
+    if not pay.invoice_payload.startswith("topup_"):
+        return
+
+    user_id = message.from_user.id
+    stars_paid = pay.total_amount            # amount verified by Telegram
+    base_inr = stars_paid * STAR_RATE
+    bonus_pct = stars_bonus_percent(stars_paid)
+    bonus_inr = base_inr * bonus_pct / 100
+    inr_added = base_inr + bonus_inr
+
+    # duplicate protection: the same charge_id is never processed twice
+    is_new = await db.save_star_payment(
+        pay.telegram_payment_charge_id, user_id, stars_paid, inr_added
+    )
+    if not is_new:
+        return
+
+    await db.update_balance(user_id, inr_added)
+    user_data = await db.get_user(user_id)
+    new_balance = user_data.get("balance", 0.0) if user_data else 0.0
+
+    bonus_line = f"🎁 Bonus ({bonus_pct}%): ₹{bonus_inr:.2f}\n" if bonus_pct else ""
+    await message.answer(
+        f"✅ **ᴘᴀʏᴍᴇɴᴛ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟ!**\n\n"
+        f"⭐ Paid: {stars_paid} Stars\n"
+        f"{bonus_line}"
+        f"💰 Added: **₹{inr_added:.2f}**\n"
+        f"💳 New Balance: **₹{new_balance:.3f}**\n\n"
+        f"🧾 Ref: `{pay.telegram_payment_charge_id}`",
+        parse_mode="Markdown"
+    )
+
+# ======================= GOOGLE PLAY CODE TOPUP =======================
+
+def gp_cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="cancel_topup")]])
+
+def gp_admin_caption(req: dict, status_line: str = "") -> str:
+    text = (
+        f"🎁 <b>Google Play Code Request #{req['request_id']}</b>\n\n"
+        f"👤 User ID: <code>{req['user_id']}</code>\n"
+        f"💰 Amount: ₹{req['amount']}\n"
+        f"🔑 Code: <code>{req['code']}</code>"
+    )
+    if status_line:
+        text += f"\n\n{status_line}"
+    return text
+
+@dp.callback_query(F.data == "cancel_topup")
+async def cancel_topup(callback: types.CallbackQuery, state: FSMContext):
+    await render_add_funds_menu(callback, state)
+    await callback.answer()
+
+@dp.callback_query(F.data == "add_funds_gp")
+async def add_funds_gp_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(GPTopupState.waiting_for_amount)
+    await callback.message.edit_text(
+        "🎁 **ᴀᴅᴅ ꜰᴜɴᴅꜱ ᴠɪᴀ ɢᴏᴏɢʟᴇ ᴘʟᴀʏ ᴄᴏᴅᴇ**\n\n"
+        "**Step 1/3 — Amount**\n\n"
+        f"• Minimum amount: **₹{GP_MIN_AMOUNT}**\n"
+        "• Code amount must end with **0 or 5** (e.g., 10, 15, 20, 25, 100)\n\n"
+        "✍️ Enter the amount of your redeem code:",
+        reply_markup=gp_cancel_kb(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.message(GPTopupState.waiting_for_amount)
+async def gp_get_amount(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("❌ Please send a whole number only (e.g., 50).", reply_markup=gp_cancel_kb())
+        return
+
+    amount = int(text)
+    if amount < GP_MIN_AMOUNT:
+        await message.answer(f"❌ Minimum amount is ₹{GP_MIN_AMOUNT}. Please send a higher amount:", reply_markup=gp_cancel_kb())
+        return
+    if amount > GP_MAX_AMOUNT:
+        await message.answer(f"❌ Maximum amount is ₹{GP_MAX_AMOUNT} per code. Please send a lower amount:", reply_markup=gp_cancel_kb())
+        return
+    if amount % 5 != 0:
+        await message.answer(
+            "❌ Invalid amount. The amount must end with 0 or 5 (e.g., 10, 15, 20, 25, 100). Please try again:",
+            reply_markup=gp_cancel_kb()
+        )
+        return
+
+    await state.update_data(gp_amount=amount)
+    await state.set_state(GPTopupState.waiting_for_code)
+    await message.answer(
+        "**Step 2/3 — Redeem Code**\n\n"
+        f"✅ Amount: **₹{amount}**\n\n"
+        "🔑 Now send your **Google Play redeem code** (as text):",
+        reply_markup=gp_cancel_kb(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(GPTopupState.waiting_for_code)
+async def gp_get_code(message: types.Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    code = re.sub(r"[\s-]", "", raw).upper()
+    if not re.fullmatch(r"[A-Z0-9]{10,30}", code):
+        await message.answer("❌ Invalid code format. Please send the redeem code as text:", reply_markup=gp_cancel_kb())
+        return
+
+    await state.update_data(gp_code=code)
+    await state.set_state(GPTopupState.waiting_for_screenshot)
+    await message.answer(
+        "**Step 3/3 — Screenshot**\n\n"
+        "📸 Now send a **screenshot of the purchase** in which the redeem code is clearly visible.",
+        reply_markup=gp_cancel_kb(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(GPTopupState.waiting_for_screenshot)
+async def gp_get_screenshot(message: types.Message, state: FSMContext):
+    if not message.photo:
+        await message.answer("❌ Please send the screenshot as a photo.", reply_markup=gp_cancel_kb())
+        return
+
+    data = await state.get_data()
+    amount = data.get("gp_amount")
+    code = data.get("gp_code")
+    if not amount or not code:
+        await state.clear()
+        await message.answer("❌ Session expired. Please start again from the wallet.")
+        return
+
+    file_id = message.photo[-1].file_id
+    req_id, result = await db.create_gp_request(message.from_user.id, amount, code, file_id)
+
+    if result == "limit":
+        await state.clear()
+        await message.answer("❌ You already have pending requests. Please wait until they are reviewed.")
+        return
+    if result == "duplicate":
+        await message.answer("❌ This redeem code has already been submitted.", reply_markup=gp_cancel_kb())
+        return
+
+    req = await db.get_gp_request(req_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=sc("✅ Accept"), callback_data=f"gp_ok_{req_id}"),
+        InlineKeyboardButton(text=sc("❌ Reject"), callback_data=f"gp_no_{req_id}")
+    ]])
+
+    admin_ids = [OWNER_ID] + ([CO_OWNER_ID] if CO_OWNER_ID else [])
+    delivered = False
+    for admin_id in admin_ids:
+        try:
+            await bot.send_photo(admin_id, file_id, caption=gp_admin_caption(req), reply_markup=kb, parse_mode="HTML")
+            delivered = True
+        except Exception as e:
+            print(f"GP admin notify error: {e}")
+
+    await state.clear()
+    if not delivered:
+        await db.set_gp_status(req_id, "rejected")
+        await db.release_gp_code(code)
+        await message.answer("⚠️ Could not submit your request right now. Please try again later.")
+        return
+
+    await message.answer(
+        f"✅ **ʀᴇqᴜᴇꜱᴛ ꜱᴜʙᴍɪᴛᴛᴇᴅ!**\n\n"
+        f"💰 Amount: ₹{amount}\n"
+        f"💳 You will receive: ₹{amount * GP_RATE:.2f}\n\n"
+        "⏳ Your code will be verified soon. You will be notified once it is approved or rejected.",
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("gp_ok_"))
+async def gp_approve(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    req_id = int(callback.data.split("_")[2])
+    req = await db.set_gp_status(req_id, "approved")
+    if not req:
+        await callback.answer("Already processed.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    credit = req["amount"] * GP_RATE
+    await db.update_balance(req["user_id"], credit)
+    await db.save_payment_record(req["user_id"], credit, "GPLAY", "TOPUP_SUCCESS")
+
+    try:
+        await bot.send_message(
+            req["user_id"],
+            f"✅ **ɢᴏᴏɢʟᴇ ᴘʟᴀʏ ᴄᴏᴅᴇ ᴀᴘᴘʀᴏᴠᴇᴅ!**\n\nAdded **₹{credit:.2f}** to your wallet balance.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    try:
+        await callback.message.edit_caption(
+            caption=gp_admin_caption(req, "✅ <b>APPROVED</b> (balance added)"),
+            reply_markup=None, parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await callback.answer("Approved ✅")
+
+@dp.callback_query(F.data.startswith("gp_no_"))
+async def gp_reject(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    req_id = int(callback.data.split("_")[2])
+    req = await db.set_gp_status(req_id, "rejected")
+    if not req:
+        await callback.answer("Already processed.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    await db.release_gp_code(req["code"])
+
+    try:
+        await bot.send_message(
+            req["user_id"],
+            "❌ **ɢᴏᴏɢʟᴇ ᴘʟᴀʏ ᴄᴏᴅᴇ ʀᴇᴊᴇᴄᴛᴇᴅ.**\n\n"
+            "Your redeem code could not be verified (invalid, already used, or not from a valid source). "
+            "No balance was added. If you think this is a mistake, please contact support.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    try:
+        await callback.message.edit_caption(
+            caption=gp_admin_caption(req, "❌ <b>REJECTED</b>"),
+            reply_markup=None, parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await callback.answer("Rejected ❌")
+
+# ======================= DEPOSIT (UPI / CRYPTO) =======================
+
+def deposit_admin_caption(req: dict, status_line: str = "") -> str:
+    text = (
+        f"💳 <b>Deposit Request #{req['request_id']}</b>\n\n"
+        f"👤 User ID: <code>{req['user_id']}</code>\n"
+        f"💰 Amount: ₹{req['amount']}\n"
+        f"🏦 Method: {req['method']}"
+    )
+    if status_line:
+        text += f"\n\n{status_line}"
+    return text
+
+@dp.message(Command("deposit"))
+@dp.callback_query(F.data == "add_funds_deposit")
+async def add_funds_deposit_menu(event: types.Message | types.CallbackQuery, state: FSMContext):
+    await state.set_state(DepositState.waiting_for_amount)
+    text = (
+        "➕ **ᴅᴇᴘᴏꜱɪᴛ ꜰᴜɴᴅꜱ**\n\n"
+        "**Step 1/3 — Amount**\n\n"
+        f"Minimum deposit: **₹{DEPOSIT_MIN_AMOUNT}**\n\n"
+        "Please enter the amount you want to deposit (in ₹):"
+    )
+    markup = gp_cancel_kb()
+    if isinstance(event, types.CallbackQuery):
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=markup, parse_mode="Markdown")
+
+@dp.message(DepositState.waiting_for_amount)
+async def deposit_get_amount(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("❌ Please send a whole number only (e.g., 50).", reply_markup=gp_cancel_kb())
+        return
+
+    amount = int(text)
+    if amount < DEPOSIT_MIN_AMOUNT:
+        await message.answer(f"❌ Minimum deposit is ₹{DEPOSIT_MIN_AMOUNT}. Please send a higher amount:", reply_markup=gp_cancel_kb())
+        return
+
+    await state.update_data(dep_amount=amount)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=sc("₿ Crypto"), callback_data="dep_crypto")],
+        [InlineKeyboardButton(text=sc("📱 UPI"), callback_data="dep_upi")],
+        [InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="cancel_topup")]
+    ])
+    await message.answer(f"**Step 2/3 — Payment Method**\n\n💰 Amount: ₹{amount}\n\nChoose a payment method:", reply_markup=kb, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "dep_crypto")
+async def deposit_pick_crypto(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "❌ This payment method is currently unavailable.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="add_funds_deposit")]])
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "dep_upi")
+async def deposit_pick_upi(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    amount = data.get("dep_amount")
+    if not amount:
+        await callback.answer("Session expired. Please start again.", show_alert=True)
+        return
+
+    await state.set_state(DepositState.waiting_for_screenshot)
+    caption = (
+        f"📱 **ᴜᴘɪ ᴘᴀʏᴍᴇɴᴛ**\n\n"
+        f"**Step 3/3 — Pay & Confirm**\n\n"
+        f"💰 Amount: ₹{amount}\n"
+        f"🆔 UPI ID: `{UPI_ID}`\n\n"
+        f"Pay using the QR code and send the screenshot."
+    )
+    try:
+        photo = types.FSInputFile(UPI_QR_IMAGE_PATH)
+        await callback.message.answer_photo(photo, caption=caption, parse_mode="Markdown", reply_markup=gp_cancel_kb())
+    except Exception:
+        await callback.message.answer(caption, parse_mode="Markdown", reply_markup=gp_cancel_kb())
+    await callback.answer()
+
+@dp.message(DepositState.waiting_for_screenshot)
+async def deposit_get_screenshot(message: types.Message, state: FSMContext):
+    if not message.photo:
+        await message.answer("❌ Please send the payment screenshot as a photo.", reply_markup=gp_cancel_kb())
+        return
+
+    data = await state.get_data()
+    amount = data.get("dep_amount")
+    if not amount:
+        await state.clear()
+        await message.answer("❌ Session expired. Please start again from the wallet.")
+        return
+
+    file_id = message.photo[-1].file_id
+    await state.update_data(dep_file_id=file_id)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=sc("✅ Confirm"), callback_data="dep_confirm"),
+        InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="dep_cancel_screenshot")
+    ]])
+    await message.answer_photo(
+        file_id,
+        caption=f"💰 Amount: ₹{amount}\n\nConfirm to submit the receipt?",
+        reply_markup=kb
+    )
+
+@dp.callback_query(F.data == "dep_cancel_screenshot")
+async def deposit_cancel_screenshot(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.edit_caption(caption="❌ Deposit request cancelled.", reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer()
+
+@dp.callback_query(F.data == "dep_confirm")
+async def deposit_confirm(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    amount = data.get("dep_amount")
+    file_id = data.get("dep_file_id")
+    if not amount or not file_id:
+        await state.clear()
+        await callback.answer("❌ Session expired.", show_alert=True)
+        return
+
+    req_id, result = await db.create_deposit_request(callback.from_user.id, amount, "UPI", file_id)
+    await state.clear()
+
+    if result == "pending":
+        await callback.message.edit_caption(
+            caption="❌ You already have a pending deposit request. Please wait until it is reviewed.",
+            reply_markup=None
+        )
+        await callback.answer()
+        return
+
+    req = await db.get_deposit_request(req_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=sc("✅ Approve"), callback_data=f"dep_ok_{req_id}"),
+        InlineKeyboardButton(text=sc("❌ Reject"), callback_data=f"dep_no_{req_id}")
+    ]])
+
+    admin_ids = [OWNER_ID] + ([CO_OWNER_ID] if CO_OWNER_ID else [])
+    delivered = False
+    for admin_id in admin_ids:
+        try:
+            await bot.send_photo(admin_id, file_id, caption=deposit_admin_caption(req), reply_markup=kb, parse_mode="HTML")
+            delivered = True
+        except Exception as e:
+            print(f"Deposit admin notify error: {e}")
+
+    if not delivered:
+        await db.set_deposit_status(req_id, "rejected")
+        await callback.message.edit_caption(caption="⚠️ Could not submit your request right now. Please try again later.", reply_markup=None)
+        await callback.answer()
+        return
+
+    await callback.message.edit_caption(
+        caption="✅ Your payment request has been successfully submitted. Please wait for admin's approval.",
+        reply_markup=None
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("dep_ok_"))
+async def deposit_approve(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    req_id = int(callback.data.split("_")[2])
+    req = await db.set_deposit_status(req_id, "approved")
+    if not req:
+        await callback.answer("Already processed.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    amount = req["amount"]
+    await db.update_balance(req["user_id"], amount)
+    await db.save_payment_record(req["user_id"], amount, "DEPOSIT", "TOPUP_SUCCESS")
+
+    try:
+        await bot.send_message(
+            req["user_id"],
+            f"✅ **ᴅᴇᴘᴏꜱɪᴛ ᴀᴘᴘʀᴏᴠᴇᴅ!**\n\nAdded **₹{amount:.2f}** to your wallet balance.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    try:
+        await callback.message.edit_caption(
+            caption=deposit_admin_caption(req, "✅ <b>APPROVED</b> (balance added)"),
+            reply_markup=None, parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await callback.answer("Approved ✅")
+
+@dp.callback_query(F.data.startswith("dep_no_"))
+async def deposit_reject(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    req_id = int(callback.data.split("_")[2])
+    req = await db.set_deposit_status(req_id, "rejected")
+    if not req:
+        await callback.answer("Already processed.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    try:
+        await bot.send_message(
+            req["user_id"],
+            "❌ **ᴅᴇᴘᴏꜱɪᴛ ʀᴇᴊᴇᴄᴛᴇᴅ.**\n\n"
+            "Your deposit request could not be verified. No balance was added. "
+            "If you think this is a mistake, please contact support.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    try:
+        await callback.message.edit_caption(
+            caption=deposit_admin_caption(req, "❌ <b>REJECTED</b>"),
+            reply_markup=None, parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    await callback.answer("Rejected ❌")
+
+@dp.message(Command("referral"))
+@dp.callback_query(F.data == "referral_menu")
+async def referral_handler(event: types.Message | types.CallbackQuery):
+    user_id = event.from_user.id
+    user = await db.get_user(user_id)
+    bot_user = await bot.get_me()
+    ref_link = f"https://t.me/{bot_user.username}?start=ref_{user_id}"
+    ref_count = user.get("referral_count", 0)
+
+    text = (
+        f"👥 **ʀᴇꜰᴇʀʀᴀʟ ᴘʀᴏɢʀᴀᴍ**\n\n"
+        f"Invite your friends and earn **₹0.001** for each referral when they join and verify their membership!\n\n"
+        f"🔗 **ʏᴏᴜʀ ʀᴇꜰᴇʀʀᴀʟ ʟɪɴᴋ:**\n`{ref_link}`\n\n"
+        f"📊 Total Verified Referrals: **{ref_count}**"
+    )
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="back_home")]]
+
+    if isinstance(event, types.CallbackQuery):
+        await event.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    else:
+        await event.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "shop")
+async def show_shop(callback: types.CallbackQuery):
+    tiers = await db.get_tiers()
+    if not tiers:
+        await callback.message.edit_text(
+            "❌ No account types available right now.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="back_home")]])
+        )
+        return
+
+    kb = [[InlineKeyboardButton(text=sc(name), callback_data=f"tier_{tid}")] for tid, name in tiers]
+    kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="back_home")])
+    await callback.message.edit_text(
+        sc("🛍️ **Select an Account Type:**"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("tier_"))
+async def show_tier_categories(callback: types.CallbackQuery):
+    tier_id = int(callback.data.split("_", 1)[1])
+    tier = await db.get_tier_by_id(tier_id)
+    label = tier["name"] if tier else "Unknown"
+
+    categories = await db.get_categories_with_counts(tier_id)
+    if not categories:
+        await callback.message.edit_text(
+            f"❌ No categories available in {label} yet.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="shop")]])
+        )
+        return
+
+    kb = []
+    for c_id, c_name, available_count in categories:
+        if available_count == 0:
+            label = f"📂 {c_name} (Out of Stock)"
+        elif available_count <= LOW_STOCK_THRESHOLD:
+            label = f"📂 {c_name} (🔥 Only {available_count} left!)"
+        else:
+            label = f"📂 {c_name} ({available_count} Available)"
+        kb.append([InlineKeyboardButton(text=sc(label), callback_data=f"cat_{c_id}")])
+    kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="shop")])
+
+    await callback.message.edit_text(
+        sc(f"🛍️ **{label} — Select a Country:**"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="Markdown"
+    )
+
+SHOP_PAGE_SIZE = 5
+
+@dp.callback_query(F.data.startswith("cat_"))
+async def show_category_items(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    cat_id = int(parts[1])
+    page = int(parts[2]) if len(parts) > 2 else 0
+
+    category = await db.get_category_by_id(cat_id)
+    tier_id = category.get("tier_id") if category else None
+    back_target = f"tier_{tier_id}" if tier_id is not None else "shop"
+
+    accounts = await db.get_available_accounts(cat_id)
+
+    if not accounts:
+        await callback.message.edit_text("❌ No accounts available in this category.",
+                                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data=back_target)]]))
+        return
+
+    total_pages = (len(accounts) + SHOP_PAGE_SIZE - 1) // SHOP_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start = page * SHOP_PAGE_SIZE
+    page_items = accounts[start:start + SHOP_PAGE_SIZE]
+
+    kb = [[InlineKeyboardButton(text=sc(f"{display_name} - ₹{price}"), callback_data=f"select_acc_{acc_id}")] for acc_id, display_name, price in page_items]
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text=sc("⬅️ Prev"), callback_data=f"cat_{cat_id}_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text=sc("Next ➡️"), callback_data=f"cat_{cat_id}_{page + 1}"))
+    if nav_row:
+        kb.append(nav_row)
+
+    kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data=back_target)])
+
+    await callback.message.edit_text(
+        sc(f"📦 **Available Accounts (Page {page + 1}/{total_pages}):**"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("select_acc_"))
+async def show_purchase_confirmation(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[2])
+    account = await db.get_account_by_id(acc_id)
+
+    if not account or account.get("is_sold") == 1:
+        await callback.answer("❌ This account is no longer available.", show_alert=True)
+        return
+
+    user = await db.get_user(callback.from_user.id)
+    user_balance = user['balance']
+    price = account['price']
+    after_balance = user_balance - price
+
+    text = (
+        f"🛒 **ᴄᴏɴꜰɪʀᴍ ᴘᴜʀᴄʜᴀꜱᴇ**\n\n"
+        f"📦 Item: {account.get('display_name', 'Account')}\n"
+        f"💰 Price: `₹{price:.2f}`\n"
+        f"💳 Current Balance: `₹{user_balance:.3f}`\n"
+        f"💳 Balance After Purchase: `₹{after_balance:.3f}`\n\n"
+        f"Do you want to proceed?"
+    )
+
+    kb = [
+        [InlineKeyboardButton(text=sc("✅ Confirm Purchase"), callback_data=f"do_buy_{acc_id}")],
+        [InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"cat_{account['category_id']}")]
+    ]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+
+def md_table_escape(text) -> str:
+    """Keeps a value from breaking a markdown table cell or rich-text syntax."""
+    return str(text).replace("|", "\\|").replace("`", "'").replace("\n", " ").strip()
+
+async def send_rich_message(chat_id, markdown_text: str, fallback_html: str = None):
+    """Sends a Telegram 'rich message' (Bot API 10.1+ sendRichMessage: real
+    headings, tables, etc.) built from the given markdown. If the rich
+    endpoint rejects the call or errors out for any reason, falls back to a
+    normal HTML message (fallback_html) so the notification is never lost.
+    Returns True if the rich message was sent, False if it fell back
+    (or failed outright with no fallback given)."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendRichMessage"
+    payload = {"chat_id": chat_id, "rich_message": {"markdown": markdown_text}}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    return True
+                print(f"sendRichMessage rejected: {data}")
+    except Exception as e:
+        print(f"sendRichMessage error: {e}")
+
+    if fallback_html:
+        try:
+            await bot.send_message(chat_id, fallback_html, parse_mode="HTML")
+        except Exception as e:
+            print(f"Rich-message fallback send error: {e}")
+    return False
+
+@dp.message(Command("groupid"))
+async def cmd_groupid(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(f"🆔 This chat's ID is:\n`{message.chat.id}`", parse_mode="Markdown")
+
+@dp.message(Command("checkchannels"))
+async def cmd_checkchannels(message: types.Message):
+    """Owner-only diagnostic: shows the bot's own status AND a target user's
+    status in every REQUIRED_CHANNELS entry, with the raw Telegram API error
+    if the lookup fails — instead of check_user_channels' silent False."""
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip().lstrip("-").isdigit():
+        target_id = int(parts[1].strip())
+    else:
+        target_id = message.from_user.id
+
+    if not REQUIRED_CHANNELS:
+        await message.answer("ℹ️ REQUIRED_CHANNELS is empty — no channels are configured right now.")
+        return
+
+    lines = [f"🔍 **Channel diagnostic for user `{target_id}`:**\n"]
+    for entry in REQUIRED_CHANNELS:
+        ch = entry.get("chat")
+        if ch is None:
+            lines.append(f"📢 Channel: `{entry['link']}`\n   ⚠️ Numeric ID not set (FORCE_JOIN_PRIVATE_ID) — membership is NOT being checked for this one.\n")
+            continue
+        block = f"📢 Channel: `{ch}`\n"
+        try:
+            bot_member = await bot.get_chat_member(chat_id=ch, user_id=bot.id)
+            is_admin_there = bot_member.status in ["administrator", "creator"]
+            block += f"   🤖 Bot's own status: `{bot_member.status}` {'✅' if is_admin_there else '⚠️ NOT ADMIN'}\n"
+        except Exception as e:
+            block += f"   🤖 Bot's own status: ❌ ERROR — `{e}`\n"
+
+        try:
+            member = await bot.get_chat_member(chat_id=ch, user_id=target_id)
+            is_member = member.status in ["member", "administrator", "creator"]
+            block += f"   👤 User's status: `{member.status}` {'✅' if is_member else '❌ not a member'}\n"
+        except Exception as e:
+            block += f"   👤 User's status: ❌ ERROR — `{e}`\n"
+
+        lines.append(block)
+
+    lines.append(sc("\n💡 tip: if bot's own status shows 'left' or an error, the bot was removed or was never made admin in that channel — add it back as admin. if the error says 'chat not found', the channel username/id in required_channels is wrong."))
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+async def send_detailed_purchase_log(account: dict, buyer: types.User, price: float):
+    """Sends a full-detail log of the sale to the private admin group (DETAILED_LOG_GROUP_ID).
+    Separate from the public LOG_CHANNEL notification, which stays as-is."""
+    if not DETAILED_LOG_GROUP_ID:
+        print("ADMIN_LOG_GROUP_ID not set - detailed sale log skipped")
+        return
+    phone = account.get("phone_number", "Unknown")
+    acc_tg_user_id = account.get("telegram_user_id")
+    acc_username = account.get("telegram_username")
+    two_step_enabled = account.get("two_step_enabled", False)
+    two_step = account.get("two_step", "")
+    session_string = account.get("session_string", "")
+    sold_at = account.get("sold_at")
+    sold_at_str = sold_at.strftime("%d %b %Y, %I:%M %p") if sold_at else "Just now"
+
+    buyer_name = html.escape(buyer.full_name or "Unknown")
+    buyer_username = f"@{html.escape(buyer.username)}" if buyer.username else "Not set"
+    buyer_link = f'<a href="tg://user?id={buyer.id}">{buyer_name}</a>'
+
+    acc_username_display = f"@{html.escape(acc_username)}" if acc_username else "Not set"
+
+    divider = "━━━━━━━━━━━━━━━━━━━━"
+    text = (
+        "🛒 <b>NEW ACCOUNT SOLD</b>\n"
+        f"{divider}\n\n"
+        "📦 <b>Account Details</b>\n"
+        f"📱 Phone: <code>{html.escape(str(phone))}</code>\n"
+        f"🆔 User ID: <code>{html.escape(str(acc_tg_user_id or 'Unknown'))}</code>\n"
+        f"📛 Username: {acc_username_display}\n"
+        f"🔐 2-Step: <code>{'ON' if two_step_enabled else 'OFF'}</code>\n"
+        f"🔑 Password: <code>{html.escape(str(two_step) if two_step else 'None')}</code>\n"
+        f"🔑 Session:\n<code>{html.escape(str(session_string))}</code>\n\n"
+        f"{divider}\n"
+        "💳 <b>Transaction</b>\n"
+        f"💰 Price: ₹{price:.2f}\n"
+        f"🕐 Time: {sold_at_str}\n\n"
+        f"{divider}\n"
+        "👤 <b>Buyer</b>\n"
+        f"Name: {buyer_link}\n"
+        f"ID: <code>{buyer.id}</code>\n"
+        f"Username: {buyer_username}\n\n"
+        f"{divider}\n"
+        "📨 OTP Deliveries: <b>0</b> so far"
+    )
+
+    md_buyer_name = md_table_escape(buyer.full_name or "Unknown")
+    md_buyer_username = f"@{buyer.username}" if buyer.username else "Not set"
+    md_acc_username = f"@{acc_username}" if acc_username else "Not set"
+
+    markdown_text = (
+        "## 🛒 New Account Sold\n\n"
+        "| Field | Value |\n"
+        "| --- | --- |\n"
+        f"| Phone | `{md_table_escape(phone)}` |\n"
+        f"| User ID | `{md_table_escape(acc_tg_user_id or 'Unknown')}` |\n"
+        f"| Username | {md_acc_username} |\n"
+        f"| 2-Step | `{'ON' if two_step_enabled else 'OFF'}` |\n"
+        f"| Password | `{md_table_escape(two_step) if two_step else 'None'}` |\n"
+        f"| Price | ₹{price:.2f} |\n"
+        f"| Time | {sold_at_str} |\n\n"
+        "**Session String:**\n"
+        f"```\n{session_string}\n```\n\n"
+        "### 👤 Buyer\n"
+        f"| Field | Value |\n"
+        "| --- | --- |\n"
+        f"| Name | [{md_buyer_name}](tg://user?id={buyer.id}) |\n"
+        f"| ID | `{buyer.id}` |\n"
+        f"| Username | {md_buyer_username} |\n\n"
+        "📨 **OTP Deliveries:** 0 so far"
+    )
+
+    await send_rich_message(DETAILED_LOG_GROUP_ID, markdown_text, fallback_html=text)
+
+async def send_otp_delivery_log(account: dict, buyer_id: int, delivery_count: int):
+    """Sends a short log to the group every time an OTP is delivered for a sold account."""
+    if not DETAILED_LOG_GROUP_ID:
+        return
+    phone = account.get("phone_number", "Unknown")
+    acc_id = account.get("account_id")
+    now_str = datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p")
+
+    text = (
+        "📨 <b>OTP DELIVERED</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📱 Phone: <code>{html.escape(str(phone))}</code>\n"
+        f"🆔 Account ID: <code>{acc_id}</code>\n"
+        f"🔢 Delivery: <b>#{delivery_count}</b>\n"
+        f"🕐 Time: {now_str}\n"
+        f"👤 Buyer ID: <code>{buyer_id}</code>"
+    )
+    markdown_text = (
+        "## 📨 OTP Delivered\n\n"
+        "| Field | Value |\n"
+        "| --- | --- |\n"
+        f"| Phone | `{md_table_escape(phone)}` |\n"
+        f"| Account ID | `{acc_id}` |\n"
+        f"| Delivery | #{delivery_count} |\n"
+        f"| Time | {now_str} |\n"
+        f"| Buyer ID | `{buyer_id}` |"
+    )
+
+    await send_rich_message(DETAILED_LOG_GROUP_ID, markdown_text, fallback_html=text)
+
+def build_account_details_text(account: dict) -> str:
+    return (
+        f"✅ **ᴀᴄᴄᴏᴜɴᴛ ᴅᴇᴛᴀɪʟꜱ**\n\n"
+        f"📱 **Number:** `{account.get('phone_number', 'Unknown')}`\n"
+        f"🆔 **User ID:** `{account.get('telegram_user_id') or 'Unknown'}`\n"
+        f"🔑 **Session String:**\n`{account.get('session_string')}`\n\n"
+        f"🔐 **2-Step Verification:** `{'ON' if account.get('two_step_enabled') else 'OFF'}`\n"
+        f"🔑 **2-Step Password:** `{account.get('two_step') or 'None'}`\n\n"
+        f"👇 Use the buttons below to get your OTP code or manage devices:"
+    )
+
+def build_account_details_kb(acc_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=sc("📥 Get Code"), callback_data=f"get_otp_{acc_id}"),
+            InlineKeyboardButton(text=sc("📱 Devices"), callback_data=f"devices_{acc_id}")
+        ],
+        [InlineKeyboardButton(text=sc("⚠️ Report Issue"), callback_data=f"report_issue_{acc_id}")],
+        [InlineKeyboardButton(text=sc("🏠 Main Menu"), callback_data="back_home")]
+    ])
+
+
+@dp.callback_query(F.data.startswith("report_issue_"))
+async def report_issue_start(callback: types.CallbackQuery, state: FSMContext):
+    acc_id = int(callback.data.split("_", 2)[2])
+    account = await db.get_account_by_id(acc_id)
+    if not account or account.get("sold_to") != callback.from_user.id:
+        await callback.answer("❌ This account does not belong to you.", show_alert=True)
+        return
+
+    await state.update_data(report_acc_id=acc_id)
+    await state.set_state(ReportIssueState.waiting_for_description)
+    await callback.message.answer(
+        "⚠️ **Report an Issue**\n\n"
+        "Please describe the problem with this account (e.g., OTP not arriving, account logged out, wrong details). "
+        "An admin will review it shortly:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="report_issue_cancel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "report_issue_cancel")
+async def report_issue_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Report cancelled.")
+    await callback.answer()
+
+
+@dp.message(ReportIssueState.waiting_for_description)
+async def report_issue_submit(message: types.Message, state: FSMContext):
+    description = (message.text or "").strip()
+    if not description:
+        await message.answer("❌ Please describe the issue as text:")
+        return
+
+    data = await state.get_data()
+    acc_id = data.get("report_acc_id")
+    await state.clear()
+
+    account = await db.get_account_by_id(acc_id) if acc_id else None
+    buyer = message.from_user
+    buyer_name = html.escape(buyer.full_name or "Unknown")
+    buyer_username = f"@{html.escape(buyer.username)}" if buyer.username else "None"
+
+    admin_text = (
+        f"⚠️ <b>Issue Reported</b>\n\n"
+        f"👤 Buyer: <a href='tg://user?id={buyer.id}'>{buyer_name}</a> ({buyer_username})\n"
+        f"🆔 Buyer ID: <code>{buyer.id}</code>\n"
+        f"📦 Account: {html.escape(str(account.get('display_name', 'Unknown'))) if account else 'Unknown'}\n"
+        f"📱 Phone: <code>{account.get('phone_number', 'Unknown') if account else 'Unknown'}</code>\n"
+        f"🆔 Account ID: <code>{acc_id}</code>\n\n"
+        f"📝 Description:\n{html.escape(description)}"
+    )
+
+    admin_ids = [OWNER_ID] + ([CO_OWNER_ID] if CO_OWNER_ID else [])
+    delivered = False
+    for admin_id in admin_ids:
+        try:
+            await bot.send_message(admin_id, admin_text, parse_mode="HTML")
+            delivered = True
+        except Exception as e:
+            print(f"Report issue admin notify error: {e}")
+
+    if delivered:
+        await message.answer("✅ Your report has been sent to the admin. We'll get back to you soon.")
+    else:
+        await message.answer("⚠️ Could not send your report right now. Please contact support directly.")
+
+@dp.callback_query(F.data.startswith("viewacc_"))
+async def view_account_details(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[1])
+    account = await db.get_account_by_id(acc_id)
+
+    if not account:
+        await callback.answer("❌ Account details not found.", show_alert=True)
+        return
+    if account.get("sold_to") != callback.from_user.id:
+        await callback.answer("❌ This account does not belong to you.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        build_account_details_text(account),
+        reply_markup=build_account_details_kb(acc_id),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("do_buy_"))
+async def process_purchase(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    account = await db.get_account_by_id(acc_id)
+    if not account or account.get("is_sold") == 1:
+        await callback.answer("❌ This account is no longer available.", show_alert=True)
+        return
+
+    status, claimed = await db.buy_account_safely(user_id, acc_id)
+
+    if status == "success":
+        phone = claimed["phone_number"]
+        session = claimed["session_string"]
+        price = claimed["price"]
+        two_step = claimed.get("two_step", "")
+        two_step_enabled = claimed.get("two_step_enabled", False)
+        tg_user_id = claimed.get("telegram_user_id")
+        tg_username = claimed.get("telegram_username")
+
+        asyncio.create_task(start_userbot_for_account(phone, session, bot, user_id))
+
+        masked_phone = mask_phone_number(phone)
+        masked_user = str(user_id)[:2] + "***" + str(user_id)[-3:] if len(str(user_id)) > 5 else "***"
+        bot_user = await bot.get_me()
+        bot_username = bot_user.username
+        item_name = account.get('display_name', 'Account')
+
+        channel_divider = "━━━━━━━━━━━━━━━━━━━━"
+        channel_text = (
+            "🚀 <b>NEW ACCOUNT SOLD!</b>\n"
+            f"{channel_divider}\n\n"
+            f"👤 User: <code>{html.escape(masked_user)}</code>\n"
+            f"📦 Item: <b>{html.escape(str(item_name))}</b>\n"
+            f"📍 Region: {html.escape(str(item_name))}\n"
+            f"📱 Number: <code>{html.escape(masked_phone)}</code>\n"
+            f"💰 Price: <b>₹{price:.1f}</b>\n"
+            f"⚡ Status: ✅ Verified &amp; Delivered\n\n"
+            f"{channel_divider}\n"
+            f"🤖 Always use @{html.escape(bot_username)}"
+        )
+
+        LOG_CHANNEL = "@Logs_4888"
+        channel_markdown = (
+            "## 🚀 New Account Sold!\n\n"
+            "| Field | Value |\n"
+            "| --- | --- |\n"
+            f"| User | `{md_table_escape(masked_user)}` |\n"
+            f"| Item | **{md_table_escape(item_name)}** |\n"
+            f"| Region | {md_table_escape(item_name)} |\n"
+            f"| Number | `{md_table_escape(masked_phone)}` |\n"
+            f"| Price | **₹{price:.1f}** |\n"
+            f"| Status | ✅ Verified & Delivered |\n\n"
+            f"🤖 Always use @{bot_username}"
+        )
+        await send_rich_message(LOG_CHANNEL, channel_markdown, fallback_html=channel_text)
+
+        await send_detailed_purchase_log(claimed, callback.from_user, price)
+
+        details_text = build_account_details_text({
+            "phone_number": phone,
+            "telegram_user_id": tg_user_id,
+            "session_string": session,
+            "two_step": two_step,
+            "two_step_enabled": two_step_enabled,
+        }).replace("✅ **ᴀᴄᴄᴏᴜɴᴛ ᴅᴇᴛᴀɪʟꜱ**", "✅ **ᴘᴜʀᴄʜᴀꜱᴇ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟ!**", 1)
+
+        await callback.message.edit_text(details_text, reply_markup=build_account_details_kb(acc_id), parse_mode="Markdown")
+
+    elif status == "low_balance":
+        await callback.answer("❌ Insufficient balance! Please add funds to your wallet.", show_alert=True)
+    else:
+        await callback.answer("❌ Sorry, this account was already sold.", show_alert=True)
+
+async def render_devices(callback: types.CallbackQuery, acc_id: int, phone: str):
+    devices, error = await get_devices(phone)
+    if error:
+        await callback.answer(f"⚠️ {error}", show_alert=True)
+        return
+    if not devices:
+        await callback.answer("No active sessions found.", show_alert=True)
+        return
+
+    lines = ["📱 **ʟᴏɢɢᴇᴅ-ɪɴ ᴅᴇᴠɪᴄᴇꜱ**\n"]
+    kb_rows = []
+    for idx, d in enumerate(devices, start=1):
+        if d["current"]:
+            lines.append(f"**{idx}. Device {idx}** - Bot Session (current)")
+            kb_rows.append([InlineKeyboardButton(
+                text=f"⚠️ Terminate - Device {idx} (Bot Session)",
+                callback_data=f"trmbot_{acc_id}"
+            )])
+        else:
+            extra = f" ({d['country']})" if d["country"] else ""
+            lines.append(f"**{idx}. Device {idx}** - {d['label']}{extra}")
+            kb_rows.append([InlineKeyboardButton(
+                text=f"❌ Terminate - Device {idx}",
+                callback_data=f"trm_{acc_id}_{d['hash']}"
+            )])
+
+    kb_rows.append([InlineKeyboardButton(text=sc("🔄 Refresh"), callback_data=f"devices_{acc_id}")])
+    kb_rows.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"viewacc_{acc_id}")])
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("devices_"))
+async def devices_handler(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[1])
+    account = await db.get_account_by_id(acc_id)
+
+    if not account:
+        await callback.answer("❌ Account details not found.", show_alert=True)
+        return
+
+    if account.get("sold_to") != callback.from_user.id:
+        await callback.answer("❌ This account does not belong to you.", show_alert=True)
+        return
+
+    phone = account.get('phone_number')
+    client = active_clients.get(phone)
+
+    if not client:
+        asyncio.create_task(start_userbot_for_account(phone, account['session_string'], bot, callback.from_user.id))
+        await callback.answer("⏳ Initializing userbot, please tap 'Devices' again after 5 seconds.", show_alert=True)
+        return
+
+    touch(phone)
+    await render_devices(callback, acc_id, phone)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("trm_"))
+async def terminate_device_handler(callback: types.CallbackQuery):
+    parts = callback.data.split("_", 2)
+    acc_id = int(parts[1])
+    auth_hash = int(parts[2])
+
+    account = await db.get_account_by_id(acc_id)
+    if not account:
+        await callback.answer("❌ Account details not found.", show_alert=True)
+        return
+
+    if account.get("sold_to") != callback.from_user.id:
+        await callback.answer("❌ This account does not belong to you.", show_alert=True)
+        return
+
+    phone = account.get('phone_number')
+    ok, error = await terminate_device(phone, auth_hash)
+    if not ok:
+        await callback.answer(f"⚠️ {error}", show_alert=True)
+        return
+
+    await callback.answer("✅ Device terminated!", show_alert=True)
+    await render_devices(callback, acc_id, phone)
+
+@dp.callback_query(F.data.startswith("trmbot_"))
+async def terminate_bot_session_confirm(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[1])
+    account = await db.get_account_by_id(acc_id)
+
+    if not account:
+        await callback.answer("❌ Account details not found.", show_alert=True)
+        return
+    if account.get("sold_to") != callback.from_user.id:
+        await callback.answer("❌ This account does not belong to you.", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=sc("✅ Yes, terminate it"), callback_data=f"trmbotok_{acc_id}")],
+        [InlineKeyboardButton(text=sc("❌ Cancel"), callback_data=f"devices_{acc_id}")]
+    ])
+    await callback.message.edit_text(
+        "⚠️ **ᴡᴀʀɴɪɴɢ**\n\n"
+        "This will permanently remove our bot's access to this account.\n\n"
+        "After this, **Get Code** and **Devices** will stop working for this account — "
+        "the account will be fully and exclusively yours, and no one else will be able to log in to it remotely.\n\n"
+        "This action **cannot be undone**. Continue?",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("trmbotok_"))
+async def terminate_bot_session_execute(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[1])
+    account = await db.get_account_by_id(acc_id)
+
+    if not account:
+        await callback.answer("❌ Account details not found.", show_alert=True)
+        return
+    if account.get("sold_to") != callback.from_user.id:
+        await callback.answer("❌ This account does not belong to you.", show_alert=True)
+        return
+
+    phone = account.get('phone_number')
+    ok, error = await terminate_bot_session(phone)
+    if not ok:
+        await callback.answer(f"⚠️ {error}", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "✅ **ᴅᴏɴᴇ!**\n\nOur bot's session has been terminated. This account is now fully and exclusively yours.",
+        parse_mode="Markdown"
+    )
+    await callback.answer("✅ Bot session terminated!", show_alert=True)
+
+@dp.callback_query(F.data.startswith("get_otp_"))
+async def get_otp_handler(callback: types.CallbackQuery):
+    acc_id = int(callback.data.split("_")[2])
+    account = await db.get_account_by_id(acc_id)
+
+    if not account:
+        await callback.answer("❌ Account details not found.", show_alert=True)
+        return
+
+    # OWNERSHIP CHECK: only the buyer can fetch the OTP
+    if account.get("sold_to") != callback.from_user.id:
+        await callback.answer("❌ This account does not belong to you.", show_alert=True)
+        return
+
+    phone = account.get('phone_number')
+    client = active_clients.get(phone)
+
+    if not client:
+        asyncio.create_task(start_userbot_for_account(phone, account['session_string'], bot, callback.from_user.id))
+        await callback.answer("⏳ Initializing userbot, please click 'Get Code' again after 5 seconds.", show_alert=True)
+        return
+
+    touch(phone)
+    try:
+        # look at the latest few messages from Telegram and take the newest one that has a code
+        messages = await client.get_messages(777000, limit=5)
+        otp_code = None
+        for m in messages:
+            match = re.search(r'\b\d{4,6}\b', m.message or "")
+            if match:
+                otp_code = match.group(0)
+                break
+
+        if otp_code:
+            await callback.message.answer(f"Your code is - `{otp_code}`", parse_mode="Markdown")
+            await callback.answer("OTP sent successfully! ✅")
+
+            delivery_count = await db.log_otp_delivery(acc_id, phone)
+            await send_otp_delivery_log(account, callback.from_user.id, delivery_count)
+        else:
+            await callback.answer("⚠ No OTP received yet. Please try again later.", show_alert=True)
+    except Exception as e:
+        await callback.answer(f"⚠️ Error fetching OTP: {e}", show_alert=True)
+
+@dp.message(Command("myorders"))
+@dp.callback_query(F.data == "my_orders")
+async def my_orders_handler(event: types.Message | types.CallbackQuery):
+    user_id = event.from_user.id
+    payments = await db.get_user_payments(user_id)
+    purchases = [p for p in payments if p['status'] == 'SPEND_BUY_ACCOUNT']
+
+    text = "📦 **ʏᴏᴜʀ ᴏʀᴅᴇʀꜱ ʜɪꜱᴛᴏʀʏ:**\n\n"
+    if not purchases:
+        text += "You haven't purchased any accounts yet."
+    else:
+        for idx, p in enumerate(purchases, 1):
+            text += f"{idx}. Amount: `₹{p['amount']}` | Date: `{p['timestamp']}`\n"
+
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="back_home")]]
+
+    if isinstance(event, types.CallbackQuery):
+        await event.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    else:
+        await event.answer(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.message(Command("privacy"))
+@dp.callback_query(F.data == "privacy_policy")
+async def privacy_policy_handler(event: types.Message | types.CallbackQuery):
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="back_home")]]
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+    if isinstance(event, types.CallbackQuery):
+        await event.message.edit_text(PRIVACY_POLICY_TEXT, reply_markup=markup)
+        await event.answer()
+    else:
+        await event.answer(PRIVACY_POLICY_TEXT, reply_markup=markup)
+
+@dp.callback_query(F.data == "support")
+async def support_handler(callback: types.CallbackQuery):
+    kb = [
+        [InlineKeyboardButton(text=sc("👤 Owner"), url="https://t.me/Meto_bacchi_hu")],
+        [InlineKeyboardButton(text="💬 @Meto_bacchi_hu", url="https://t.me/Meto_bacchi_hu")],
+        [InlineKeyboardButton(text=sc("👥 Support Group"), url="https://t.me/+Gw6-s632_fI5NTQ1")],
+        [InlineKeyboardButton(text=sc("🔙 Back"), callback_data="back_home")]
+    ]
+    await callback.message.edit_text(
+        sc("🆘 **Support:**") + "\n\nFor any issues or questions, reach out below:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+
+@dp.callback_query(F.data == "my_profile")
+async def my_profile_handler(callback: types.CallbackQuery):
+    user = await db.get_user(callback.from_user.id)
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="back_home")]]
+    await callback.message.edit_text(
+        f"👤 **ʏᴏᴜʀ ᴘʀᴏꜰɪʟᴇ**\n\n"
+        f"🆔 User ID: `{callback.from_user.id}`\n"
+        f"💵 Balance: **₹{user['balance']:.3f}**\n"
+        f"✅ Verified: **{'Yes' if user['is_verified'] == 1 else 'No'}**",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+
+# ======================= ADMIN =======================
+
+@dp.message(Command("admin"))
+@dp.callback_query(F.data == "admin_panel")
+async def admin_panel(event: types.Message | types.CallbackQuery):
+    user_id = event.from_user.id
+    if not is_admin(user_id):
+        return
+
+    kb = [
+        [
+            InlineKeyboardButton(text=sc("➕ Add Account"), callback_data="admin_add_acc"),
+            InlineKeyboardButton(text=sc("📂 Manage Categories"), callback_data="admin_cats")
+        ],
+        [
+            InlineKeyboardButton(text=sc("ℹ️ Info"), callback_data="admin_info"),
+            InlineKeyboardButton(text=sc("🗑️ Delete Stock"), callback_data="admin_del_acc_list")
+        ],
+        [
+            InlineKeyboardButton(text=sc("📊 Analytics & Stats"), callback_data="admin_stats"),
+            InlineKeyboardButton(text=sc("📦 Sales History"), callback_data="admin_sales_history")
+        ],
+        [
+            InlineKeyboardButton(text=sc("👥 User Management"), callback_data="admin_users"),
+            InlineKeyboardButton(text=sc("📢 Broadcast"), callback_data="admin_broadcast")
+        ],
+        [
+            InlineKeyboardButton(text=sc("🔗 Supplier API"), callback_data="admin_supplier_menu"),
+            InlineKeyboardButton(text=sc("🩺 Account Health"), callback_data="admin_health_check")
+        ],
+        [InlineKeyboardButton(text=sc("🔙 Main Menu"), callback_data="back_home")]
+    ]
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+
+    try:
+        stats = await db.get_detailed_stock_stats()
+    except Exception:
+        stats = {"available": 0, "sold": 0, "users": 0, "revenue": 0}
+
+    text = (
+        sc("⚙️ admin control panel\n") +
+        "━━━━━━━━━━━━━━━━━━\n" +
+        sc(f"📦 stock      ·  {stats['available']} available  /  {stats['sold']} sold\n") +
+        sc(f"👥 users      ·  {stats['users']} registered\n") +
+        sc(f"💰 revenue    ·  ₹{stats['revenue']:.2f} total\n") +
+        "━━━━━━━━━━━━━━━━━━\n" +
+        sc("choose an option below 👇")
+    )
+
+    if isinstance(event, types.CallbackQuery):
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await event.answer(text, reply_markup=markup, parse_mode="Markdown")
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats_handler(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    stats = await db.get_detailed_stock_stats()
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]]
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+
+    md_table = (
+        "### 📊 Analytics & Stock Status\n\n"
+        "| Metric | Value |\n"
+        "|---|---|\n"
+        f"| Available Accounts | {stats['available']} |\n"
+        f"| Sold Accounts | {stats['sold']} |\n"
+        f"| Total Registered Users | {stats['users']} |\n"
+        f"| Total Revenue | ₹{stats['revenue']:.2f} |\n"
+    )
+    fallback_text = (
+        sc("📊 detailed analytics & stock status\n\n") +
+        sc(f"• available accounts : {stats['available']}\n") +
+        sc(f"• sold accounts      : {stats['sold']}\n") +
+        sc(f"• registered users   : {stats['users']}\n") +
+        sc(f"• total revenue      : ₹{stats['revenue']:.2f}\n")
+    )
+    await callback.message.delete()
+    await send_rich_message(callback.from_user.id, md_table, fallback_html=fallback_text)
+    await bot.send_message(callback.from_user.id, sc("🔙 back to admin panel"), reply_markup=markup)
+
+@dp.callback_query(F.data == "admin_supplier_menu")
+async def admin_supplier_menu(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    config = await db.get_supplier_config()
+    status_label = sc('active') if config['is_active'] else sc('inactive / modular placeholder')
+    url_label = config['api_url'] if config['api_url'] else sc('not set')
+    text = (
+        sc("🔗 supplier api integration settings\n\n") +
+        sc("• status  : ") + f"`{status_label}`\n" +
+        sc("• api url : ") + f"`{url_label}`\n\n" +
+        sc("use this section to configure external supplier auto-refill hooks when needed.")
+    )
+    kb = [
+        [InlineKeyboardButton(text=sc("✏️ Configure API URL & Key"), callback_data="config_supplier_step")],
+        [InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]
+    ]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "config_supplier_step")
+async def config_supplier_step(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(SupplierConfigState.waiting_for_url)
+    await callback.message.edit_text(sc("🔗 send supplier api endpoint url:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_supplier_menu")]]))
+
+@dp.message(SupplierConfigState.waiting_for_url)
+async def supplier_get_url(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.update_data(supplier_url=message.text.strip())
+    await state.set_state(SupplierConfigState.waiting_for_key)
+    await message.answer(sc("🔑 send supplier api key / token:"))
+
+@dp.message(SupplierConfigState.waiting_for_key)
+async def supplier_get_key(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    key = message.text.strip()
+    data = await state.get_data()
+    url = data.get("supplier_url")
+    await db.set_supplier_config(url, key, is_active=True)
+    await state.clear()
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]]
+    await message.answer(sc("✅ supplier api configuration saved successfully!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "admin_health_check")
+async def admin_health_check(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    accounts = await db.get_all_unsold_accounts()
+    total_unsold = len(accounts)
+    text = (
+        sc("🩺 account health check report\n\n") +
+        sc(f"• total unsold accounts in stock : `{total_unsold}`\n") +
+        sc("• session validation status       : all sessions are registered in db.\n")
+    )
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "admin_info")
+async def admin_info_categories(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    tiers = await db.get_tiers()
+    kb = [[InlineKeyboardButton(text=sc(name), callback_data=f"admininfotier_{tid}")] for tid, name in tiers]
+    kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")])
+    await callback.message.edit_text(
+        sc("ℹ️ select a type:"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("admininfotier_"))
+async def admin_info_tier_categories(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    tier_id = int(callback.data.split("_", 1)[1])
+    tier = await db.get_tier_by_id(tier_id)
+    label = tier["name"] if tier else "Unknown"
+
+    categories = await db.get_categories_with_counts(tier_id)
+    if not categories:
+        await callback.message.edit_text(
+            sc(f"❌ no categories available in {label}."),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_info")]])
+        )
+        return
+
+    kb = [[InlineKeyboardButton(text=sc(f"📂 {name}"), callback_data=f"infostat_{cid}")] for cid, name, _count in categories]
+    kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_info")])
+    await callback.message.edit_text(
+        sc(f"ℹ️ {label} — select a category to view account info:"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("infostat_"))
+async def admin_info_status_menu(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    cat_id = int(callback.data.split("_")[1])
+
+    category = await db.get_category_by_id(cat_id)
+    tier_id = category.get("tier_id") if category else None
+    back_target = f"admininfotier_{tier_id}" if tier_id is not None else "admin_info"
+
+    accounts = await db.get_accounts_by_category_full(cat_id)
+    if not accounts:
+        await callback.message.edit_text(
+            sc("❌ no accounts in this category."),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data=back_target)]])
+        )
+        return
+
+    available_count = sum(1 for a in accounts if a.get("is_sold") != 1)
+    sold_count = sum(1 for a in accounts if a.get("is_sold") == 1)
+
+    kb = [
+        [InlineKeyboardButton(text=sc(f"✅ Available ({available_count})"), callback_data=f"infolist_{cat_id}_avail_0")],
+        [InlineKeyboardButton(text=sc(f"❌ Sold ({sold_count})"), callback_data=f"infolist_{cat_id}_sold_0")],
+        [InlineKeyboardButton(text=sc("🔙 Back"), callback_data=back_target)]
+    ]
+    await callback.message.edit_text(
+        sc("ℹ️ choose which accounts to view:"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="Markdown"
+    )
+
+ADMIN_INFO_PAGE_SIZE = 3
+
+@dp.callback_query(F.data.startswith("infolist_"))
+async def admin_info_accounts(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    parts = callback.data.split("_")
+    cat_id = int(parts[1])
+    status = parts[2]  # "avail" or "sold"
+    page = int(parts[3]) if len(parts) > 3 else 0
+
+    all_accounts = await db.get_accounts_by_category_full(cat_id)
+    if status == "sold":
+        accounts = [a for a in all_accounts if a.get("is_sold") == 1]
+        label = "❌ Sold"
+    else:
+        accounts = [a for a in all_accounts if a.get("is_sold") != 1]
+        label = "✅ Available"
+
+    if not accounts:
+        await callback.message.edit_text(
+            sc(f"❌ no {label.split(' ', 1)[-1].lower()} accounts in this category."),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"infostat_{cat_id}")]])
+        )
+        return
+
+    total_pages = (len(accounts) + ADMIN_INFO_PAGE_SIZE - 1) // ADMIN_INFO_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start = page * ADMIN_INFO_PAGE_SIZE
+    page_items = accounts[start:start + ADMIN_INFO_PAGE_SIZE]
+
+    lines = [sc(f"ℹ️ {label} accounts (page {page + 1}/{total_pages})\n")]
+    for idx, acc in enumerate(page_items, start=1):
+        sold_to = sc(f"\n   👤 buyer id: ") + f"`{acc.get('sold_to')}`" if status == "sold" and acc.get("sold_to") else ""
+        two_step_label = sc("on") if acc.get("two_step_enabled") else sc("off")
+        lines.append(
+            sc(f"{start + idx}. {acc.get('display_name', 'Account')}\n") +
+            sc(f"   🆔 acc id       : ") + f"`{acc['account_id']}`\n" +
+            sc(f"   📱 phone        : ") + f"`{acc.get('phone_number', 'Unknown')}`\n" +
+            sc(f"   🆔 tg user id   : ") + f"`{acc.get('telegram_user_id') or 'Unknown'}`\n" +
+            sc(f"   💰 price        : ") + f"₹{acc.get('price')}\n" +
+            sc(f"   🔐 2-step       : ") + f"{two_step_label}{sold_to}\n"
+        )
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text=sc("⬅️ Prev"), callback_data=f"infolist_{cat_id}_{status}_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text=sc("Next ➡️"), callback_data=f"infolist_{cat_id}_{status}_{page + 1}"))
+
+    kb_rows = []
+    if nav_row:
+        kb_rows.append(nav_row)
+    kb_rows.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"infostat_{cat_id}")])
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "admin_cats")
+async def admin_cats_handler(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    tiers = await db.get_tiers()
+    kb = [[InlineKeyboardButton(text=sc(name), callback_data=f"admincattier_{tid}")] for tid, name in tiers]
+    kb.append([InlineKeyboardButton(text=sc("➕ Add New Type"), callback_data="admin_add_tier")])
+    kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")])
+    await callback.message.edit_text(
+        sc("📂 manage categories\n\nselect a type:"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "admin_add_tier")
+async def admin_add_tier_prompt(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(AddTierState.waiting_for_name)
+    await callback.message.edit_text(
+        sc("✍️ send the name of the new type (e.g., premium, vip):"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_cats")]])
+    )
+
+@dp.message(AddTierState.waiting_for_name)
+async def save_tier(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer(sc("❌ please send a valid name:"))
+        return
+    await db.add_tier(name)
+    await state.clear()
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_cats")]]
+    await message.answer(sc(f"✅ type '{name}' added successfully!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("admincattier_"))
+async def admin_cats_by_tier(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    tier_id = int(callback.data.split("_", 1)[1])
+    tier = await db.get_tier_by_id(tier_id)
+    label = tier["name"] if tier else "Unknown"
+
+    categories = await db.get_categories(tier_id)
+    kb = [[InlineKeyboardButton(text=sc(f"✏️ Edit: {c[1]}"), callback_data=f"editcat_{c[0]}")] for c in categories]
+    kb.append([InlineKeyboardButton(text=sc("➕ Add New Category"), callback_data=f"admin_add_cat_{tier_id}")])
+    kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_cats")])
+
+    await callback.message.edit_text(
+        sc(f"📂 {label} categories\n\nclick a category to edit its name:"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("editcat_"))
+async def edit_category_start(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    cat_id = int(callback.data.split("_")[1])
+    category = await db.get_category_by_id(cat_id)
+    tier_id = category.get("tier_id") if category else None
+
+    await state.update_data(editing_cat_id=cat_id, editing_cat_tier=tier_id)
+    await state.set_state(EditCategoryState.waiting_for_new_name)
+    await callback.message.edit_text(
+        sc("✍ send new category name:"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data=f"admincattier_{tier_id}")]])
+    )
+
+@dp.message(EditCategoryState.waiting_for_new_name)
+async def save_edited_category(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    cat_id = data.get("editing_cat_id")
+    tier_id = data.get("editing_cat_tier")
+    new_name = message.text
+
+    await db.update_category_name(cat_id, new_name)
+    await state.clear()
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"admincattier_{tier_id}")]]
+    await message.answer(sc(f"✅ category successfully renamed to '{new_name}'!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users_handler(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    stats = await db.get_user_management_stats()
+    kb = [
+        [InlineKeyboardButton(text=sc("🚫 Ban a User"), callback_data="admin_ban_user")],
+        [InlineKeyboardButton(text=sc("✅ Unban a User"), callback_data="admin_unban_user")],
+        [InlineKeyboardButton(text=sc("📋 View Banned Users"), callback_data="admin_banned_list_0")],
+        [InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]
+    ]
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+
+    md_table = (
+        "### 👥 User Management\n\n"
+        "| Metric | Count |\n"
+        "|---|---|\n"
+        f"| Total Users | {stats['total']} |\n"
+        f"| Verified | {stats['verified']} |\n"
+        f"| Banned | {stats['banned']} |\n"
+    )
+    fallback_text = (
+        sc("👥 user management\n\n") +
+        sc(f"• total users : {stats['total']}\n") +
+        sc(f"• verified    : {stats['verified']}\n") +
+        sc(f"• banned      : {stats['banned']}\n")
+    )
+    await callback.message.delete()
+    await send_rich_message(callback.from_user.id, md_table, fallback_html=fallback_text)
+    await bot.send_message(callback.from_user.id, sc("👇 choose an action"), reply_markup=markup)
+
+ADMIN_BANNED_PAGE_SIZE = 10
+
+@dp.callback_query(F.data.startswith("admin_banned_list_"))
+async def admin_banned_list(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    page = int(callback.data.rsplit("_", 1)[1])
+    stats = await db.get_user_management_stats()
+    total_banned = stats["banned"]
+
+    if total_banned == 0:
+        await callback.message.edit_text(
+            sc("📋 banned users\n\nno banned users right now."),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_users")]]),
+            parse_mode="Markdown"
+        )
+        return
+
+    total_pages = (total_banned + ADMIN_BANNED_PAGE_SIZE - 1) // ADMIN_BANNED_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    banned_ids = await db.get_banned_users(limit=ADMIN_BANNED_PAGE_SIZE, skip=page * ADMIN_BANNED_PAGE_SIZE)
+
+    lines = [sc(f"📋 banned users (page {page + 1}/{total_pages})"), ""]
+    lines += [sc(f"{page * ADMIN_BANNED_PAGE_SIZE + i}. ") + f"`{uid}`" for i, uid in enumerate(banned_ids, start=1)]
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text=sc("⬅️ Prev"), callback_data=f"admin_banned_list_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text=sc("Next ➡️"), callback_data=f"admin_banned_list_{page + 1}"))
+
+    kb_rows = []
+    if nav_row:
+        kb_rows.append(nav_row)
+    kb_rows.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_users")])
+
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "admin_ban_user")
+async def admin_ban_user_prompt(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(BanUserState.waiting_for_user_id)
+    await state.update_data(ban_action=1)
+    await callback.message.edit_text(sc("✍️ send the user id of the user you want to ban:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_users")]]), parse_mode="Markdown")
+
+# NOTE: the original code had no handler for admin_unban_user; added here.
+@dp.callback_query(F.data == "admin_unban_user")
+async def admin_unban_user_prompt(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(BanUserState.waiting_for_user_id)
+    await state.update_data(ban_action=0)
+    await callback.message.edit_text(sc("✍️ send the user id of the user you want to unban:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_users")]]), parse_mode="Markdown")
+
+@dp.message(BanUserState.waiting_for_user_id)
+async def execute_ban_user(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        target_id = int(message.text)
+    except (ValueError, TypeError):
+        await message.answer(sc("❌ invalid user id. please send numbers only."))
+        return
+
+    data = await state.get_data()
+    action = data.get("ban_action", 1)
+    await db.set_user_ban_status(target_id, action)
+    await state.clear()
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_users")]]
+    if action == 1:
+        await message.answer(sc("✅ user ") + f"`{target_id}`" + sc(" has been successfully banned!"), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    else:
+        await message.answer(sc("✅ user ") + f"`{target_id}`" + sc(" has been unbanned!"), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "admin_sales_history")
+async def admin_sales_history(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    sales = await db.get_all_sales_history(limit=15)
+    kb = [[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]]
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+
+    if not sales:
+        await callback.message.edit_text(
+            sc("📦 recent sales\n\nno sales records found yet."),
+            reply_markup=markup, parse_mode="Markdown"
+        )
+        return
+
+    total = sum(s.get("amount", 0) for s in sales)
+    md_rows = []
+    fallback_lines = [sc("📦 recent sales\n")]
+    for idx, s in enumerate(sales, start=1):
+        ts = s.get("timestamp")
+        date_str = ts.strftime("%d %b, %I:%M %p") if ts else "Unknown"
+        md_rows.append(f"| {idx} | ₹{s['amount']:.2f} | `{s['user_id']}` | {date_str} |")
+        fallback_lines.append(sc(f"{idx}. ₹{s['amount']:.2f} — user ") + f"`{s['user_id']}`" + sc(f" 🕐 {date_str}"))
+
+    md_table = (
+        "### 📦 Recent Sales\n\n"
+        "| # | Amount | User | Time |\n"
+        "|---|---|---|---|\n" +
+        "\n".join(md_rows) +
+        f"\n\n**Total (last {len(sales)}):** ₹{total:.2f}"
+    )
+    fallback_lines.append(sc(f"\ntotal (last {len(sales)}) : ₹{total:.2f}"))
+    fallback_text = "\n".join(fallback_lines)
+
+    await callback.message.delete()
+    await send_rich_message(callback.from_user.id, md_table, fallback_html=fallback_text)
+    await bot.send_message(callback.from_user.id, sc("🔙 back to admin panel"), reply_markup=markup)
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_prompt(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(BroadcastState.waiting_for_message)
+    await callback.message.edit_text(sc("📢 send the message/text/photo to broadcast to all users:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_panel")]]))
+
+@dp.message(BroadcastState.waiting_for_message)
+async def execute_broadcast(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    users = await db.get_all_user_ids()
+    sent = 0
+    failed = 0
+
+    status_msg = await message.answer(sc("📢 broadcast started..."))
+    for uid in users:
+        try:
+            await message.send_copy(chat_id=uid)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(
+        sc("✅ broadcast completed!\n\n") + sc(f"- sent   : {sent}\n") + sc(f"- failed : {failed}"),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "admin_del_acc_list")
+async def admin_del_acc_list(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    accounts = await db.get_all_unsold_accounts()
+    if not accounts:
+        await callback.message.edit_text(
+            sc("❌ no accounts available to delete."),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]])
+        )
+        return
+
+    kb = [[InlineKeyboardButton(text=sc(f"❌ Delete {disp_name} (₹{price})"), callback_data=f"delacc_{acc_id}")] for acc_id, disp_name, price in accounts]
+    kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")])
+
+    await callback.message.edit_text(sc("🗑️ delete account\n\nclick an account to delete it:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("delacc_"))
+async def delete_account_action(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    acc_id = int(callback.data.split("_")[1])
+    await db.delete_account(acc_id)
+    await callback.answer(sc("✅ account successfully deleted!"), show_alert=True)
+    await admin_del_acc_list(callback)
+
+@dp.callback_query(F.data.startswith("admin_add_cat_"))
+async def admin_add_cat(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    tier_id = int(callback.data.rsplit("_", 1)[1])
+    tier = await db.get_tier_by_id(tier_id)
+    label = tier["name"] if tier else "Unknown"
+
+    await state.update_data(new_cat_tier=tier_id)
+    await state.set_state(AddCategoryState.waiting_for_name)
+    await callback.message.edit_text(
+        sc(f"✍️ send the country name to add under {label}:"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_panel")]])
+    )
+
+@dp.message(AddCategoryState.waiting_for_name)
+async def save_cat(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    tier_id = data.get("new_cat_tier")
+    tier = await db.get_tier_by_id(tier_id)
+    label = tier["name"] if tier else "Unknown"
+
+    cat_id = await db.add_category(message.text, tier_id)
+    await state.clear()
+    kb = [
+        [InlineKeyboardButton(text=sc("➕ Add Account Here"), callback_data=f"selcat_{cat_id}")],
+        [InlineKeyboardButton(text=sc("🔙 Back"), callback_data=f"admincattier_{tier_id}")]
+    ]
+    await message.answer(
+        sc(f"✅ category '{message.text}' added successfully under {label}!"),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+
+@dp.message(Command("add"))
+@dp.callback_query(F.data == "admin_add_acc")
+async def admin_add_acc(event: types.Message | types.CallbackQuery, state: FSMContext):
+    user_id = event.from_user.id
+    if not is_admin(user_id):
+        return
+
+    await state.clear()
+    tiers = await db.get_tiers()
+    kb = [[InlineKeyboardButton(text=sc(name), callback_data=f"addacctier_{tid}")] for tid, name in tiers]
+    kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")])
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+    text = sc("➕ add account\n\nselect a type:")
+
+    if isinstance(event, types.CallbackQuery):
+        await event.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+        await event.answer()
+    else:
+        await event.answer(text, reply_markup=markup, parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("addacctier_"))
+async def admin_add_acc_pick_category(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    tier_id = int(callback.data.rsplit("_", 1)[1])
+    tier = await db.get_tier_by_id(tier_id)
+    label = tier["name"] if tier else "Unknown"
+
+    categories = await db.get_categories(tier_id)
+    kb = [[InlineKeyboardButton(text=sc(c[1]), callback_data=f"selcat_{c[0]}")] for c in categories]
+    kb.append([InlineKeyboardButton(text=sc("➕ Add New Country"), callback_data=f"admin_add_cat_{tier_id}")])
+    kb.append([InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_add_acc")])
+    markup = InlineKeyboardMarkup(inline_keyboard=kb)
+
+    await callback.message.edit_text(sc(f"📂 {label} — select a country:"), reply_markup=markup, parse_mode="Markdown")
+    await callback.answer()
+
+def admin_cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=sc("❌ Cancel"), callback_data="admin_add_cancel")]])
+
+@dp.callback_query(F.data == "admin_add_cancel")
+async def admin_add_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await admin_panel(callback)
+
+@dp.callback_query(F.data.startswith("selcat_"))
+async def sel_cat(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.update_data(category_id=int(callback.data.split("_")[1]))
+    await state.set_state(AddItemState.waiting_for_display_name)
+    await callback.message.edit_text(
+        sc("✍️ send display name for button (e.g., 🇮🇳 india - ₹25):"),
+        reply_markup=admin_cancel_kb()
+    )
+
+@dp.message(AddItemState.waiting_for_display_name)
+async def get_display_name(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.update_data(display_name=message.text)
+    await state.set_state(AddItemState.waiting_for_price)
+    await message.answer(sc("💵 send price in ₹ (e.g., 20.0):"), reply_markup=admin_cancel_kb())
+
+@dp.message(AddItemState.waiting_for_price)
+async def get_price(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        price = float(message.text)
+    except ValueError:
+        await message.answer(sc("❌ invalid price. enter a valid number:"), reply_markup=admin_cancel_kb())
+        return
+
+    if price <= 0:
+        await message.answer(sc("❌ price must be greater than ₹0. enter a valid price:"), reply_markup=admin_cancel_kb())
+        return
+    if price > 100000:
+        await message.answer(sc("❌ price seems too high. enter a valid price:"), reply_markup=admin_cancel_kb())
+        return
+
+    await state.update_data(price=price)
+    await state.set_state(AddItemState.waiting_for_session)
+    await message.answer(
+        sc("🔑 send the account session. any of these work:\n") +
+        sc("• a telethon session string (as text)\n") +
+        sc("• a pyrogram session string (as text)\n") +
+        sc("• a telethon or pyrogram ") + "`.session`" + sc(" file\n") +
+        sc("• a ") + "`.zip`" + sc(" file containing a ") + "`.session`" + sc(" file or a tdata folder"),
+        parse_mode="Markdown",
+        reply_markup=admin_cancel_kb()
+    )
+
+@dp.message(AddItemState.waiting_for_session)
+async def get_session(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    checking_msg = await message.answer(sc("🔍 reading session, please wait..."))
+    work_dir = tempfile.mkdtemp(prefix="sess_")
+    info, error = None, None
+
+    try:
+        if message.document:
+            fname = (message.document.file_name or "").lower()
+            local_path = os.path.join(work_dir, message.document.file_name or "upload.bin")
+            await bot.download(message.document, destination=local_path)
+
+            if fname.endswith(".session"):
+                info, error = await process_uploaded_session("file", local_path, work_dir)
+            elif fname.endswith(".zip"):
+                info, error = await process_uploaded_session("zip", local_path, work_dir)
+            else:
+                error = "Unsupported file type. Send a session string, a .session file, or a .zip file."
+        else:
+            text = (message.text or "").strip()
+            if not text:
+                error = "Please send a session string, a .session file, or a .zip file."
+            else:
+                # try as a Telethon string first, then as a Pyrogram string
+                info, error = await process_uploaded_session("telethon_string", text, work_dir)
+                if error:
+                    info2, error2 = await process_uploaded_session("pyrogram_string", text, work_dir)
+                    if not error2:
+                        info, error = info2, None
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    if error or not info:
+        await checking_msg.edit_text(
+            sc("❌ session invalid. account cannot be added.\n\n") +
+            sc("reason: ") + f"{error}" + "\n\n" +
+            sc("please send a valid session (string, .session file, or .zip):"),
+            reply_markup=admin_cancel_kb()
+        )
+        return
+
+    await state.update_data(
+        session_string=info["session_string"],
+        phone_number=info["phone_number"],
+        telegram_user_id=info["user_id"],
+        two_step_enabled=info["two_step_enabled"],
+    )
+
+    status_line = sc("on") if info["two_step_enabled"] else sc("off")
+    await state.set_state(AddItemState.waiting_for_two_step)
+    await checking_msg.edit_text(
+        sc("✅ session verified!\n\n") +
+        sc("📱 phone   : ") + f"`{info['phone_number']}`\n" +
+        sc("🆔 user id : ") + f"`{info['user_id']}`\n" +
+        sc("🔐 2-step verification (detected) : ") + f"**{status_line}**\n\n" +
+        sc("please send the 2-step password for this account (or send ") + "`skip`" + sc(" if you don't have one):"),
+        parse_mode="Markdown",
+        reply_markup=admin_cancel_kb()
+    )
+
+@dp.message(AddItemState.waiting_for_two_step)
+async def get_two_step(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    two_step = "" if raw.lower() == "skip" else raw
+    await state.update_data(two_step=two_step)
+    await finalize_add_account(message, state)
+
+async def finalize_add_account(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        await db.add_account(
+            data["category_id"],
+            data["display_name"],
+            data["phone_number"],
+            data["session_string"],
+            data["price"],
+            two_step=data.get("two_step", ""),
+            telegram_user_id=data.get("telegram_user_id"),
+            two_step_enabled=data.get("two_step_enabled", False),
+        )
+    except ValueError as e:
+        await state.clear()
+        await message.answer(sc("❌ could not add account: ") + f"{e}")
+        return
+    await state.clear()
+    kb = [
+        [InlineKeyboardButton(text=sc("➕ Add Another"), callback_data="admin_add_acc")],
+        [InlineKeyboardButton(text=sc("🔙 Back"), callback_data="admin_panel")]
+    ]
+    await message.answer(sc("✅ account added successfully!"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+JOIN_DELAY_MIN = 3   # seconds between each account's join attempt
+JOIN_DELAY_MAX = 7
+
+async def run_mass_join(target: str, accounts: list, admin_chat_id: int):
+    success = 0
+    failed = 0
+    fail_reasons = {}
+
+    for acc in accounts:
+        ok, reason = await join_channel_with_session(acc["phone_number"], acc["session_string"], target)
+        if ok:
+            success += 1
+            await db.mark_joined(acc["account_id"], target)
+        else:
+            failed += 1
+            fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+        await asyncio.sleep(random.uniform(JOIN_DELAY_MIN, JOIN_DELAY_MAX))
+
+    lines = [f"✅ **Mass-join finished** for: `{target}`", "", f"✅ Joined: {success}", f"❌ Failed: {failed}"]
+    if fail_reasons:
+        lines.append("")
+        lines.append("**Failure breakdown:**")
+        for reason, count in fail_reasons.items():
+            lines.append(f"• {reason}: {count}")
+
+    try:
+        await bot.send_message(admin_chat_id, "\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        print(f"Mass-join summary send error: {e}")
+
+@dp.message(Command("join"))
+async def cmd_join_channel(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) != 2:
+        await message.answer("Usage: `/join <channel_username_or_link>`\nExample: `/join @patricktesting`", parse_mode="Markdown")
+        return
+
+    target = args[1].strip()
+    accounts = await db.get_unjoined_accounts(target)
+    if not accounts:
+        await message.answer("✅ All accounts have already joined this channel (or there are no accounts in the database).")
+        return
+
+    est_minutes = round(len(accounts) * ((JOIN_DELAY_MIN + JOIN_DELAY_MAX) / 2) / 60, 1)
+    await message.answer(
+        f"🚀 Starting mass-join for **{len(accounts)}** accounts (already-joined accounts are skipped) into `{target}`.\n"
+        f"Estimated time: ~{est_minutes} minutes (running with a delay between each account).\n"
+        f"I'll send a summary here once it's done.",
+        parse_mode="Markdown"
+    )
+    asyncio.create_task(run_mass_join(target, accounts, message.chat.id))
+
+LOGOUT_DELAY_MIN = 1
+LOGOUT_DELAY_MAX = 3
+
+async def run_mass_logout(accounts: list, admin_chat_id: int):
+    success = 0
+    failed = 0
+    fail_reasons = {}
+
+    for acc in accounts:
+        ok, reason = await logout_session(acc["phone_number"], acc["session_string"])
+        if ok:
+            success += 1
+            await db.clear_account_session(acc["account_id"])
+        else:
+            failed += 1
+            fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+        await asyncio.sleep(random.uniform(LOGOUT_DELAY_MIN, LOGOUT_DELAY_MAX))
+
+    lines = [
+        "✅ **Mass-logout finished**", "",
+        f"✅ Logged out: {success}",
+        f"❌ Failed: {failed}",
+        "",
+        "Session strings for logged-out accounts have been cleared from the database."
+    ]
+    if fail_reasons:
+        lines.append("")
+        lines.append("**Failure breakdown:**")
+        for reason, count in fail_reasons.items():
+            lines.append(f"• {reason}: {count}")
+
+    try:
+        await bot.send_message(admin_chat_id, "\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        print(f"Mass-logout summary send error: {e}")
+
+@dp.message(Command("logoutall"))
+async def cmd_logout_all(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    accounts = await db.get_all_accounts_with_sessions()
+    if not accounts:
+        await message.answer("❌ No accounts with an active session found in the database.")
+        return
+
+    await message.answer(
+        f"🚨 Logging the bot out of **{len(accounts)}** accounts (only the bot's own session — no other device is touched).\n"
+        f"I'll send a summary here once it's done.",
+        parse_mode="Markdown"
+    )
+    asyncio.create_task(run_mass_logout(accounts, message.chat.id))
+
+@dp.message(Command("dd"))
+async def cmd_add_balance(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("Usage: `/dd <user_id> <amount>`", parse_mode="Markdown")
+        return
+    try:
+        target_id = int(args[1])
+        amount = float(args[2])
+    except ValueError:
+        await message.answer("❌ Invalid user_id or amount.")
+        return
+    if amount <= 0:
+        await message.answer("❌ Amount must be greater than 0.")
+        return
+
+    await db.update_balance(target_id, amount)
+    await db.save_payment_record(target_id, amount, "ADMIN", "ADMIN_CREDIT")
+    await message.answer(f"✅ Added ₹{amount:.2f} to user `{target_id}`'s balance.", parse_mode="Markdown")
+
+    try:
+        await bot.send_message(
+            target_id,
+            f"✅ **ʙᴀʟᴀɴᴄᴇ ᴀᴅᴅᴇᴅ**\n\nAdmin has added **₹{amount:.2f}** to your wallet balance.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+@dp.message(Command("ss"))
+async def cmd_deduct_balance(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("Usage: `/ss <user_id> <amount>`", parse_mode="Markdown")
+        return
+    try:
+        target_id = int(args[1])
+        amount = float(args[2])
+    except ValueError:
+        await message.answer("❌ Invalid user_id or amount.")
+        return
+    if amount <= 0:
+        await message.answer("❌ Amount must be greater than 0.")
+        return
+
+    await db.update_balance(target_id, -amount)
+    await db.save_payment_record(target_id, amount, "ADMIN", "ADMIN_DEBIT")
+    await message.answer(f"✅ Deducted ₹{amount:.2f} from user `{target_id}`'s balance.", parse_mode="Markdown")
+
+    try:
+        await bot.send_message(
+            target_id,
+            f"⚠️ **ʙᴀʟᴀɴᴄᴇ ᴅᴇᴅᴜᴄᴛᴇᴅ**\n\nAdmin has deducted **₹{amount:.2f}** from your wallet balance.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+@dp.callback_query(F.data == "back_home")
+async def back_home(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await send_main_menu(callback)
+
+async def main():
+    await db.init_db()
+    await set_bot_commands(bot)
+    asyncio.create_task(cleanup_idle_clients())
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
